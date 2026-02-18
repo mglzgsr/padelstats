@@ -1,0 +1,47 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+backend/venv/
+*.egg-info/
+dist/
+build/
+.env
+
+# Modelos entrenados (binarios grandes)
+*.pt
+*.onnx
+*.pkl
+
+# Base de datos local
+*.db
+*.sqlite
+*.sqlite3
+
+# Videos subidos y outputs
+uploaded_videos/
+runs/
+debug_output/
+demo_extract/
+
+# Logs
+*.log
+uvicorn_debug.log
+
+# macOS
+.DS_Store
+.AppleDouble
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Frontend
+frontend/.next/
+frontend/node_modules/
+
+# Scripts de debug
+debug_cv.py
