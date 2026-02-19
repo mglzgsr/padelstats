@@ -108,30 +108,32 @@ class VideoProcessor:
                     center_y = (y1 + y2) / 2
                     
                     # --- Context-Aware Confidence Logic ---
-                    current_threshold = 0.45 # Default strict for noise (lights)
-                    
-                    # 1. Proximity to players
-                    near_player = False
-                    if p_boxes:
-                        for p_box in p_boxes:
-                            px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy()
-                            # Use a generous box around player for sensitivity
-                            if (px1 - 80 < center_x < px2 + 80) and (py1 - 80 < center_y < py2 + 80):
-                                near_player = True
-                                break
-                    
-                    # 2. Proximity to last known position (temporal continuity)
+                    current_threshold = 0.45  # Estricto por defecto (focos, reflejos)
+
+                    # 1. Continuidad temporal: cerca de última posición conocida
                     on_trajectory = False
                     if self.last_ball_pos:
                         lx, ly, lf = self.last_ball_pos
                         dist = ((center_x - lx)**2 + (center_y - ly)**2)**0.5
-                        # If ball is within 120px of last seen position
                         if dist < 120 and (frame_count - lf) < 6:
                             on_trajectory = True
-                    
-                    if near_player or on_trajectory:
-                        current_threshold = 0.12 # High sensitivity in active zones
-                    
+
+                    # 2. Proximidad a jugadores — con margen reducido (antes 80px)
+                    near_player = False
+                    near_player_box = None
+                    if p_boxes:
+                        for p_box in p_boxes:
+                            px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy()
+                            if (px1 - 50 < center_x < px2 + 50) and (py1 - 50 < center_y < py2 + 50):
+                                near_player = True
+                                near_player_box = (px1, py1, px2, py2)
+                                break
+
+                    if on_trajectory:
+                        current_threshold = 0.15   # Seguimiento de trayectoria
+                    elif near_player:
+                        current_threshold = 0.22   # Cerca de jugador (antes 0.12)
+
                     if conf < current_threshold:
                         continue
                     # ----------------------------------------
@@ -148,19 +150,45 @@ class VideoProcessor:
                     if aspect_ratio < 0.15 or aspect_ratio > 6.0:
                         continue
                     
-                    # Filter 5: Player Adjacency (Racket rejection)
+                    # Filter: Rechazo de raqueta/mango
+                    # Si la detección está DENTRO del bbox del jugador (sin margen),
+                    # comprobamos color HSV: una pelota de pádel es blanca o amarilla
+                    # y redondeada. Un mango amarillo tiene aspecto ratio elongado.
                     is_racket = False
-                    if p_boxes:
-                        for p_box in p_boxes:
-                            px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy()
-                            p_height = py2 - py1
-                            if (px1 - 10 < center_x < px2 + 10) and (py1 - 10 < center_y < py2 - p_height * 0.2):
-                                if self.ball_velocity and np.linalg.norm(self.ball_velocity) < 2.5:
-                                    is_racket = True
-                                    break
-                                if center_y < py1 + p_height * 0.6:
-                                    is_racket = True
-                                    break
+                    if near_player_box is not None:
+                        px1, py1, px2, py2 = near_player_box
+                        p_height = py2 - py1
+                        inside_player = (px1 < center_x < px2) and (py1 < center_y < py2)
+                        if inside_player:
+                            # Raqueta/mango: detectada dentro del jugador y pelota lenta
+                            ball_speed = np.linalg.norm(self.ball_velocity) if self.ball_velocity else 0
+                            if ball_speed < 3.0:
+                                is_racket = True
+                            # Aspecto ratio muy elongado → mango, no pelota
+                            aspect_ratio_raw = box_width / box_height if box_height > 0 else 1
+                            if aspect_ratio_raw > 3.5 or aspect_ratio_raw < 0.28:
+                                is_racket = True
+                            # Confirmación de color: verificar que hay píxeles
+                            # amarillos o blancos en la zona detectada
+                            if not is_racket:
+                                rx1, ry1 = max(0, int(x1)), max(0, int(y1))
+                                rx2, ry2 = min(width - 1, int(x2)), min(height - 1, int(y2))
+                                if rx2 > rx1 and ry2 > ry1:
+                                    patch = frame[ry1:ry2, rx1:rx2]
+                                    hsv_p = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+                                    # Amarillo: H 15-40, S>80, V>80
+                                    yellow = cv2.inRange(hsv_p,
+                                                         np.array([15, 80, 80]),
+                                                         np.array([40, 255, 255]))
+                                    # Blanco: S<50, V>160
+                                    white = cv2.inRange(hsv_p,
+                                                        np.array([0, 0, 160]),
+                                                        np.array([180, 50, 255]))
+                                    ball_pixels = cv2.countNonZero(yellow) + cv2.countNonZero(white)
+                                    total_pixels = patch.shape[0] * patch.shape[1]
+                                    # Menos del 20% de píxeles de color pelota → no es pelota
+                                    if total_pixels > 0 and ball_pixels / total_pixels < 0.20:
+                                        is_racket = True
                     if is_racket:
                         continue
 
@@ -209,6 +237,8 @@ class VideoProcessor:
                 self.missed_ball_frames += 1
 
             # --- Interpolation Logic ---
+            # Bug fix: la posición interpolada debe ir a trusted_ball_boxes
+            # (antes iba a filtered_ball_boxes y nunca llegaba a shot detection)
             if not trusted_ball_boxes and self.last_ball_pos is not None and self.ball_velocity is not None:
                 speed = np.linalg.norm(self.ball_velocity)
                 if self.missed_ball_frames <= self.max_missed_frames and speed > 3:
@@ -217,9 +247,11 @@ class VideoProcessor:
                     df = frame_count - lf
                     pred_x = lx + vx * df
                     pred_y = ly + vy * df
-                    
-                    if 0 < pred_x < width and height*0.2 < pred_y < height:
-                        filtered_ball_boxes.append(SimpleBox([pred_x-10, pred_y-10, pred_x+10, pred_y+10]))
+
+                    if 0 < pred_x < width and height * 0.2 < pred_y < height:
+                        trusted_ball_boxes.append(
+                            SimpleBox([pred_x - 10, pred_y - 10, pred_x + 10, pred_y + 10])
+                        )
             # ---------------------------
             
             # El filtro de polígono ya lo aplica tracker.track_frame(),
@@ -334,13 +366,14 @@ class VideoProcessor:
         # 2. Cleanup old trajectories
         self.trajectories = [t for t in self.trajectories if (frame_count - t[-1][1]) < 8]
         
-        # 3. Find the best validated trajectory (min length 4)
+        # 3. Find the best validated trajectory (min length 3)
+        # A 60fps, 4 frames = 67ms. Bajamos a 3 para detectar pelotas rápidas.
         best_point = None
         max_len = 0
         for traj in self.trajectories:
-            if len(traj) >= 4:
+            if len(traj) >= 3:
                 if len(traj) > max_len:
                     max_len = len(traj)
                     best_point = traj[-1][0]
-                    
+
         return best_point
