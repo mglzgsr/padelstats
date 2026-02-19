@@ -28,6 +28,11 @@ class Tracker:
     # Ajustar según el ángulo de cámara de tu cancha (típico cámara fondo: 0.60-0.68).
     NET_Y = 0.63
 
+    # Buffer alrededor de la red (fracción de altura).
+    # Un jugador dentro del buffer se considera "zona ambigua": no se penaliza
+    # por cruzar zona, evitando swaps cuando se acerca a la red.
+    NET_Y_BUFFER = 0.05  # ±54px en 1080p
+
     def __init__(self, model_path='yolov8n.pt', ball_model_path='backend/tennis_ball_best.pt'):
         self.model_persons = YOLO(model_path)
         self.model_persons.to('mps')
@@ -39,11 +44,9 @@ class Tracker:
         # Cada slot: {"last_pos": (x,y), "last_frame": int, "yolo_id": int, "hist": ndarray, "zone": str}
         self.slots = {1: None, 2: None, 3: None, 4: None}
 
-        # Qué zona pertenece a cada slot (se fija al primer frame con 4 jugadores)
+        # Zona fija de cada slot: near (cámara) o far (fondo).
+        # Slots 1 y 2 = near, slots 3 y 4 = far. No se cambia durante el partido.
         self.slot_zones = {1: "near", 2: "near", 3: "far", 4: "far"}
-        # Una vez fijada la zona de un slot, no se reasigna (protege contra
-        # oscilaciones cuando un jugador se acerca a la red)
-        self._slot_zone_locked = {1: False, 2: False, 3: False, 4: False}
 
         self.max_lost_frames = 300   # ~10 segundos a 30fps
         self.max_distance = 250      # píxeles máximos entre frames consecutivos
@@ -60,14 +63,21 @@ class Tracker:
 
     def _get_zone(self, feet_y: float) -> str:
         """
-        Clasifica un jugador como 'near' o 'far' usando la posición de sus PIES.
-        'near': pies por debajo de la red (Y > NET_Y * frame_height)
-        'far':  pies por encima de la red (Y < NET_Y * frame_height)
+        Clasifica un jugador como 'near', 'far' o 'ambiguous'.
+        'near':      pies claramente por debajo de la red
+        'far':       pies claramente por encima de la red
+        'ambiguous': pies dentro del buffer ±NET_Y_BUFFER alrededor de la red
+                     → no se aplica penalización de zona en el matching
         """
         if self.frame_height is None:
             return "near"
-        net_pixel_y = self.frame_height * self.NET_Y
-        return "near" if feet_y > net_pixel_y else "far"
+        net_px = self.frame_height * self.NET_Y
+        buf_px = self.frame_height * self.NET_Y_BUFFER
+        if feet_y > net_px + buf_px:
+            return "near"
+        if feet_y < net_px - buf_px:
+            return "far"
+        return "ambiguous"
 
     def _get_color_histogram(self, frame, xyxy) -> np.ndarray | None:
         """Histograma HSV normalizado de la región del torso del jugador."""
@@ -159,8 +169,15 @@ class Tracker:
                     color   = self._hist_distance(d["hist"], data.get("hist"))
                     base    = 0.55 * color + 0.45 * spatial
 
-                    # Penalizar si la zona del jugador no coincide con la del slot
-                    penalty = CROSS_ZONE_PENALTY if d["zone"] != self.slot_zones[sid] else 0.0
+                    # Penalizar si la zona del jugador no coincide con la del slot.
+                    # Si el jugador está en la zona buffer ("ambiguous"), no se penaliza:
+                    # que color+posición decidan sin sesgo de zona.
+                    det_zone = d["zone"]
+                    slot_zone = self.slot_zones[sid]
+                    if det_zone != "ambiguous" and det_zone != slot_zone:
+                        penalty = CROSS_ZONE_PENALTY
+                    else:
+                        penalty = 0.0
                     cost[r, c] = min(base + penalty, 2.0)
 
             row_ind, col_ind = linear_sum_assignment(cost)
@@ -185,15 +202,25 @@ class Tracker:
         unassigned.sort(key=lambda rd: rd[1]["pos"][0])  # izquierda primero
 
         for r, d in unassigned:
-            # Buscar slot vacío de la zona correcta según los pies del jugador
-            target_zone = d["zone"]
-            candidates = [
-                sid for sid, data in self.slots.items()
-                if data is None and self.slot_zones[sid] == target_zone
-            ]
-            if not candidates:
-                # Fallback: cualquier slot vacío
-                candidates = [sid for sid, data in self.slots.items() if data is None]
+            det_zone = d["zone"]
+            if det_zone == "ambiguous":
+                # En la zona buffer: elegir el slot vacío más cercano espacialmente
+                empty_slots = [(sid, data) for sid, data in self.slots.items() if data is None]
+                # Preferir el slot cuya zona coincide con la última posición del jugador
+                # (near vs far) usando NET_Y como referencia dura como desempate
+                raw_zone = "near" if d["xyxy"][3] > (self.frame_height or 0) * self.NET_Y else "far"
+                candidates = [sid for sid, _ in empty_slots if self.slot_zones[sid] == raw_zone]
+                if not candidates:
+                    candidates = [sid for sid, _ in empty_slots]
+            else:
+                # Zona clara: buscar slot vacío de la zona correcta
+                candidates = [
+                    sid for sid, data in self.slots.items()
+                    if data is None and self.slot_zones[sid] == det_zone
+                ]
+                if not candidates:
+                    # Fallback: cualquier slot vacío
+                    candidates = [sid for sid, data in self.slots.items() if data is None]
             if not candidates:
                 continue
 
