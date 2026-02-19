@@ -17,10 +17,16 @@ class Tracker:
         - Slot 3: izquierda, Slot 4: derecha
 
     Esto garantiza que los equipos nunca intercambien IDs entre sí.
+
+    La separación usa los PIES del jugador (xyxy[3]) comparados con NET_Y,
+    que representa la posición de la red en el frame. Los pies de los
+    jugadores del fondo nunca cruzan la red, por lo que este límite es fiable.
     """
 
-    # Límite vertical que separa las dos zonas (fracción de altura del frame)
-    ZONE_BOUNDARY = 0.52
+    # Posición de la red como fracción de la altura del frame.
+    # Los pies de los jugadores lejanos siempre quedan por encima de este valor.
+    # Ajustar según el ángulo de cámara de tu cancha (típico cámara fondo: 0.60-0.68).
+    NET_Y = 0.63
 
     def __init__(self, model_path='yolov8n.pt', ball_model_path='backend/tennis_ball_best.pt'):
         self.model_persons = YOLO(model_path)
@@ -33,8 +39,11 @@ class Tracker:
         # Cada slot: {"last_pos": (x,y), "last_frame": int, "yolo_id": int, "hist": ndarray, "zone": str}
         self.slots = {1: None, 2: None, 3: None, 4: None}
 
-        # Qué zona pertenece a cada slot
+        # Qué zona pertenece a cada slot (se fija al primer frame con 4 jugadores)
         self.slot_zones = {1: "near", 2: "near", 3: "far", 4: "far"}
+        # Una vez fijada la zona de un slot, no se reasigna (protege contra
+        # oscilaciones cuando un jugador se acerca a la red)
+        self._slot_zone_locked = {1: False, 2: False, 3: False, 4: False}
 
         self.max_lost_frames = 300   # ~10 segundos a 30fps
         self.max_distance = 250      # píxeles máximos entre frames consecutivos
@@ -49,12 +58,16 @@ class Tracker:
     # Utilidades privadas
     # ------------------------------------------------------------------
 
-    def _get_zone(self, pos_y: float) -> str:
-        """Clasifica una posición Y como 'near' (abajo) o 'far' (arriba)."""
+    def _get_zone(self, feet_y: float) -> str:
+        """
+        Clasifica un jugador como 'near' o 'far' usando la posición de sus PIES.
+        'near': pies por debajo de la red (Y > NET_Y * frame_height)
+        'far':  pies por encima de la red (Y < NET_Y * frame_height)
+        """
         if self.frame_height is None:
             return "near"
-        boundary = self.frame_height * self.ZONE_BOUNDARY
-        return "near" if pos_y > boundary else "far"
+        net_pixel_y = self.frame_height * self.NET_Y
+        return "near" if feet_y > net_pixel_y else "far"
 
     def _get_color_histogram(self, frame, xyxy) -> np.ndarray | None:
         """Histograma HSV normalizado de la región del torso del jugador."""
@@ -98,103 +111,93 @@ class Tracker:
     # Lógica de asignación
     # ------------------------------------------------------------------
 
-    def _assign_zone(self, zone_detections: list, zone_slot_ids: list, frame_count: int):
+    def _update_slots(self, detections: list, frame_count: int, frame=None) -> dict:
         """
-        Asigna detecciones a slots de una zona usando el algoritmo húngaro.
-        Modifica self.slots in-place y retorna {yolo_id: slot_id}.
+        Actualiza los slots con las detecciones del frame actual.
+        Retorna {yolo_id: slot_id}.
+
+        Estrategia de dos fases:
+        1. Matching global (sin restricción de zona) contra slots ya activos.
+           Esto evita que los jugadores pierdan su slot al cruzar NET_Y.
+        2. Detecciones sin asignar llenan slots vacíos, usando zona para
+           decidir cuál slot vacío corresponde (near vs far).
         """
+        if self.frame_height is None and frame is not None:
+            self.frame_height = frame.shape[0]
+
+        # Calcular histogramas y zona inicial para cada detección
+        for d in detections:
+            d["hist"] = self._get_color_histogram(frame, d["xyxy"]) if frame is not None else None
+            d["zone"] = self._get_zone(d["xyxy"][3])  # pies = y2
+
         mapping = {}
-
-        if not zone_detections:
-            return mapping
-
-        active_slots = [sid for sid in zone_slot_ids if self.slots[sid] is not None]
-        empty_slots = [sid for sid in zone_slot_ids if self.slots[sid] is None]
-
         assigned_det_indices = set()
 
-        # --- Fase 1: Asignación óptima a slots activos (algoritmo húngaro) ---
-        if active_slots:
-            n_dets = len(zone_detections)
+        # --- Fase 1: Matching global contra slots activos (sin restricción de zona) ---
+        active_slots = [sid for sid, data in self.slots.items() if data is not None]
+
+        if active_slots and detections:
+            n_dets  = len(detections)
             n_slots = len(active_slots)
             cost = np.full((n_dets, n_slots), fill_value=2.0)
 
-            for r, d in enumerate(zone_detections):
+            for r, d in enumerate(detections):
                 for c, sid in enumerate(active_slots):
                     data = self.slots[sid]
                     dist = np.hypot(
                         d["pos"][0] - data["last_pos"][0],
                         d["pos"][1] - data["last_pos"][1]
                     )
-                    # Rechazar si demasiado lejos (hard constraint)
                     if dist > self.max_distance * 2.0:
-                        cost[r, c] = 2.0
-                        continue
+                        continue  # deja cost en 2.0 (rechazado)
 
                     spatial = min(dist / self.max_distance, 1.0)
-                    color = self._hist_distance(d["hist"], data.get("hist"))
+                    color   = self._hist_distance(d["hist"], data.get("hist"))
                     cost[r, c] = 0.55 * color + 0.45 * spatial
 
             row_ind, col_ind = linear_sum_assignment(cost)
 
             for r, c in zip(row_ind, col_ind):
-                if cost[r, c] >= 0.75:  # Umbral de aceptación
+                if cost[r, c] >= 0.75:
                     continue
                 sid = active_slots[c]
-                d = zone_detections[r]
+                d   = detections[r]
                 self.slots[sid] = {
-                    "last_pos": d["pos"],
+                    "last_pos":   d["pos"],
                     "last_frame": frame_count,
-                    "yolo_id": d["id"],
-                    "hist": self._blend_hist(self.slots[sid].get("hist"), d["hist"]),
-                    "zone": d["zone"],
+                    "yolo_id":    d["id"],
+                    "hist":       self._blend_hist(self.slots[sid].get("hist"), d["hist"]),
+                    "zone":       self.slot_zones[sid],  # zona del slot, no del frame actual
                 }
                 mapping[d["id"]] = sid
                 assigned_det_indices.add(r)
 
-        # --- Fase 2: Detecciones no asignadas llenan slots vacíos ---
-        unassigned = [
-            (r, d) for r, d in enumerate(zone_detections)
-            if r not in assigned_det_indices
-        ]
-        # Ordenar por X para asignación consistente (izquierda primero)
-        unassigned.sort(key=lambda rd: rd[1]["pos"][0])
+        # --- Fase 2: Detecciones sin asignar → llenan slots vacíos por zona ---
+        unassigned = [(r, d) for r, d in enumerate(detections) if r not in assigned_det_indices]
+        unassigned.sort(key=lambda rd: rd[1]["pos"][0])  # izquierda primero
 
-        for (r, d), sid in zip(unassigned, empty_slots):
+        for r, d in unassigned:
+            # Buscar slot vacío de la zona correcta según los pies del jugador
+            target_zone = d["zone"]
+            candidates = [
+                sid for sid, data in self.slots.items()
+                if data is None and self.slot_zones[sid] == target_zone
+            ]
+            if not candidates:
+                # Fallback: cualquier slot vacío
+                candidates = [sid for sid, data in self.slots.items() if data is None]
+            if not candidates:
+                continue
+
+            sid = candidates[0]
             self.slots[sid] = {
-                "last_pos": d["pos"],
+                "last_pos":   d["pos"],
                 "last_frame": frame_count,
-                "yolo_id": d["id"],
-                "hist": d["hist"],
-                "zone": d["zone"],
+                "yolo_id":    d["id"],
+                "hist":       d["hist"],
+                "zone":       self.slot_zones[sid],
             }
             mapping[d["id"]] = sid
-
-        return mapping
-
-    def _update_slots(self, detections: list, frame_count: int, frame=None) -> dict:
-        """
-        Actualiza los slots con las detecciones del frame actual.
-        Retorna {yolo_id: slot_id}.
-        """
-        if self.frame_height is None and frame is not None:
-            self.frame_height = frame.shape[0]
-
-        # Calcular histogramas y zona para cada detección
-        for d in detections:
-            d["hist"] = self._get_color_histogram(frame, d["xyxy"]) if frame is not None else None
-            d["zone"] = self._get_zone(d["pos"][1])
-
-        # Separar por zona
-        near_dets = [d for d in detections if d["zone"] == "near"]
-        far_dets = [d for d in detections if d["zone"] == "far"]
-
-        near_slots = [sid for sid, z in self.slot_zones.items() if z == "near"]
-        far_slots = [sid for sid, z in self.slot_zones.items() if z == "far"]
-
-        mapping = {}
-        mapping.update(self._assign_zone(near_dets, near_slots, frame_count))
-        mapping.update(self._assign_zone(far_dets, far_slots, frame_count))
 
         # Expirar slots sin actualización reciente
         for sid, data in self.slots.items():
