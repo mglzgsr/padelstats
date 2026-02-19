@@ -48,7 +48,7 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
     if not ret:
         break
 
-    results   = tracker.track_frame(frame, frame_count)
+    results   = tracker.track_frame(frame, frame_count, court_polygon=court_polygon)
     p_results = results["person_results"]
     mapping   = p_results.slot_mapping if hasattr(p_results, "slot_mapping") else {}
 
@@ -60,10 +60,8 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
     cv2.putText(ann, f"RED (NET_Y={tracker.NET_Y})", (20, net_y - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
-    # --- Polígono de cancha (semi-transparente) ---
-    overlay = ann.copy()
-    cv2.polylines(overlay, [court_polygon], True, (0, 255, 200), 2)
-    cv2.addWeighted(overlay, 0.4, ann, 0.6, 0, ann)
+    # Polígono de cancha: solo en modo debug, línea fina gris
+    cv2.polylines(ann, [court_polygon], True, (80, 80, 80), 1)
 
     if p_results.boxes and p_results.boxes.id is not None:
         boxes_raw = p_results.boxes.xyxy.cpu().numpy()

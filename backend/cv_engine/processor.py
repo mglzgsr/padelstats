@@ -60,19 +60,28 @@ class VideoProcessor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
 
+        # Polígono de cancha fijo para todo el video (filtra jugadores fuera de pista)
+        top_y_court = int(height * 0.45)
+        court_polygon = np.array([
+            [int(width * 0.25), top_y_court],
+            [int(width * 0.75), top_y_court],
+            [width, height],
+            [0, height]
+        ], np.int32)
+
         frame_count = 0
         while cap.isOpened():
             ret, frame = cap.read()
             if not ret:
                 break
-            
+
             # 1. Detect Court Lines
             court_lines = self.court_detector.detect(frame)
             if court_lines is not None:
                 self.stats["court_detected"] += 1
-            
-            # 2. Track Objects
-            track_results = self.tracker.track_frame(frame)
+
+            # 2. Track Objects (solo jugadores dentro de la cancha)
+            track_results = self.tracker.track_frame(frame, frame_count, court_polygon=court_polygon)
             person_results = track_results["person_results"]
             ball_results = track_results["ball_results"]
             
@@ -213,18 +222,9 @@ class VideoProcessor:
                         filtered_ball_boxes.append(SimpleBox([pred_x-10, pred_y-10, pred_x+10, pred_y+10]))
             # ---------------------------
             
-            # Filter: Players Inside Court Only
-            h_frame, w_frame = frame.shape[:2]
-            top_y_court = int(h_frame * 0.45)
-            court_pts = np.array([[int(w_frame * 0.25), top_y_court], [int(w_frame * 0.75), top_y_court], [w_frame, h_frame], [0, h_frame]], np.int32)
-            
-            filtered_p_boxes = []
-            if p_boxes:
-                for p_box in p_boxes:
-                    px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy()
-                    bottom_center = ( (px1 + px2)/2, py2 )
-                    if cv2.pointPolygonTest(court_pts, bottom_center, False) >= 0:
-                        filtered_p_boxes.append(p_box)
+            # El filtro de polígono ya lo aplica tracker.track_frame(),
+            # así que todos los boxes en p_boxes son jugadores válidos en pista.
+            filtered_p_boxes = list(p_boxes) if p_boxes else []
             
             # --- Shot Classification Logic ---
             ball_pos = None

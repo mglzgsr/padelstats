@@ -133,7 +133,11 @@ class Tracker:
         mapping = {}
         assigned_det_indices = set()
 
-        # --- Fase 1: Matching global contra slots activos (sin restricción de zona) ---
+        # --- Fase 1: Matching global contra slots activos ---
+        # Se permite cruce de zona pero se penaliza para evitar swaps accidentales.
+        # Un jugador near nunca debería costar menos en un slot far que en el suyo.
+        CROSS_ZONE_PENALTY = 0.50
+
         active_slots = [sid for sid, data in self.slots.items() if data is not None]
 
         if active_slots and detections:
@@ -153,7 +157,11 @@ class Tracker:
 
                     spatial = min(dist / self.max_distance, 1.0)
                     color   = self._hist_distance(d["hist"], data.get("hist"))
-                    cost[r, c] = 0.55 * color + 0.45 * spatial
+                    base    = 0.55 * color + 0.45 * spatial
+
+                    # Penalizar si la zona del jugador no coincide con la del slot
+                    penalty = CROSS_ZONE_PENALTY if d["zone"] != self.slot_zones[sid] else 0.0
+                    cost[r, c] = min(base + penalty, 2.0)
 
             row_ind, col_ind = linear_sum_assignment(cost)
 
@@ -210,7 +218,14 @@ class Tracker:
     # API pública
     # ------------------------------------------------------------------
 
-    def track_frame(self, frame, frame_count: int = 0) -> dict:
+    def track_frame(self, frame, frame_count: int = 0,
+                    court_polygon: np.ndarray | None = None) -> dict:
+        """
+        court_polygon: polígono np.int32 (N,2) que define la zona de juego.
+            Si se pasa, las detecciones con pies fuera del polígono se ignoran
+            antes de la asignación de slots (evita que espectadores/árbitros
+            reciban un ID de jugador).
+        """
         # Detección de personas
         person_results = self.model_persons.track(
             frame, persist=True, classes=[0], conf=0.25, verbose=False
@@ -221,6 +236,11 @@ class Tracker:
             detections = []
             for i, yolo_id in enumerate(person_results.boxes.id.cpu().numpy()):
                 xyxy = person_results.boxes.xyxy[i].cpu().numpy()
+                # Filtro de polígono: solo jugadores con pies dentro de la cancha
+                if court_polygon is not None:
+                    feet = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
+                    if cv2.pointPolygonTest(court_polygon, feet, False) < 0:
+                        continue
                 pos = ((xyxy[0] + xyxy[2]) / 2, (xyxy[1] + xyxy[3]) / 2)
                 detections.append({"id": int(yolo_id), "pos": pos, "xyxy": xyxy})
 
