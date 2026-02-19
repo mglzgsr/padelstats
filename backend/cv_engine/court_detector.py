@@ -19,6 +19,11 @@ class CourtDetector:
         self._poly_alpha = 0.05  # Actualización lenta para la detección automática
         self._polygon_fixed = False  # True cuando viene de calibración manual
 
+        # Líneas y paredes fijas (cuando vienen de calibración manual)
+        self._fixed_lines = None   # np.array formato HoughLinesP
+        self._lines_fixed = False
+        self._walls = {}           # {"left": [(x1,y1),(x2,y2)], "right": ..., "net": ...}
+
         # Intentar cargar calibración manual
         if config_path and os.path.exists(config_path):
             self._load_config(config_path)
@@ -44,8 +49,31 @@ class CourtDetector:
         hull = cv2.convexHull(all_pts)
         self._stable_polygon = hull.reshape(-1, 2).astype(np.int32)
         self._polygon_fixed = True
-        print(f"[CourtDetector] Polígono cargado desde {config_path} "
-              f"({len(pts)} puntos + esquinas inferiores) — detección automática desactivada.")
+
+        # Cargar líneas de cancha calibradas (si existen)
+        court_lines_cfg = config.get("court_lines", {})
+        line_segs = []
+        for key in ("service_line_far", "service_line_near", "center_line"):
+            seg = court_lines_cfg.get(key)
+            if seg and len(seg) == 2:
+                x1, y1 = seg[0]
+                x2, y2 = seg[1]
+                line_segs.append([[x1, y1, x2, y2]])
+        if line_segs:
+            self._fixed_lines = np.array(line_segs, dtype=np.int32)
+            self._lines_fixed = True
+
+        # Cargar paredes calibradas (si existen)
+        walls_cfg = config.get("walls", {})
+        for wall_key in ("left", "right", "net"):
+            seg = walls_cfg.get(wall_key)
+            if seg and len(seg) == 2:
+                self._walls[wall_key] = [tuple(seg[0]), tuple(seg[1])]
+
+        print(f"[CourtDetector] Cargado desde {config_path}: "
+              f"polígono={len(pts)}pts, "
+              f"líneas={len(line_segs)}, "
+              f"paredes={list(self._walls.keys())}")
 
     # ------------------------------------------------------------------
     # Detección del polígono de pista (suelo azul)
@@ -125,13 +153,21 @@ class CourtDetector:
     # Detección de líneas internas
     # ------------------------------------------------------------------
 
+    def get_walls(self) -> dict:
+        """Devuelve las paredes calibradas: {'left': [(x1,y1),(x2,y2)], 'right': ..., 'net': ...}"""
+        return self._walls
+
     def detect(self, frame, debug=False):
         """
-        Detecta las líneas internas de la pista: líneas de servicio (horizontales),
-        línea central de saque (vertical) y bandas laterales (diagonales).
-        Los segmentos Hough se fusionan por regresión lineal para obtener
-        líneas limpias y extendidas en lugar de decenas de trozos cortos.
+        Detecta las líneas internas de la pista. Si hay calibración manual
+        (court_config.json con court_lines), las devuelve directamente sin
+        procesar el frame. Si no, usa detección automática con Hough.
         """
+        # Calibración manual disponible: sin coste computacional
+        if self._lines_fixed and self._fixed_lines is not None:
+            self.court_lines = self._fixed_lines
+            return self._fixed_lines
+
         h, w = frame.shape[:2]
 
         # ROI: polígono de pista o trapecio de respaldo
