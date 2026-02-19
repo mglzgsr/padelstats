@@ -44,9 +44,18 @@ class Tracker:
         # Cada slot: {"last_pos": (x,y), "last_frame": int, "yolo_id": int, "hist": ndarray, "zone": str}
         self.slots = {1: None, 2: None, 3: None, 4: None}
 
-        # Zona fija de cada slot: near (cámara) o far (fondo).
-        # Slots 1 y 2 = near, slots 3 y 4 = far. No se cambia durante el partido.
+        # Zona actual de cada slot: near (cámara) o far (fondo).
+        # Se inicializa con la distribución por defecto pero se adapta automáticamente
+        # si un jugador lleva suficientes frames consecutivos en la zona contraria
+        # (p.ej. cambio de lado entre sets).
         self.slot_zones = {1: "near", 2: "near", 3: "far", 4: "far"}
+
+        # Contador de frames consecutivos en zona "equivocada" por slot.
+        # Cuando supera ZONE_FLIP_FRAMES, se confirma el cambio de zona.
+        self._zone_wrong_frames = {1: 0, 2: 0, 3: 0, 4: 0}
+        # Frames consecutivos necesarios para confirmar un cambio de zona.
+        # ~2s a 60fps: cubre cambio de lado pero no aproximaciones a la red.
+        self.ZONE_FLIP_FRAMES = 120
 
         self.max_lost_frames = 300   # ~10 segundos a 30fps
         self.max_distance = 250      # píxeles máximos entre frames consecutivos
@@ -109,6 +118,38 @@ class Tracker:
         blended = (1.0 - self.hist_alpha) * old_hist + self.hist_alpha * new_hist
         norm = np.linalg.norm(blended)
         return blended / norm if norm > 0 else blended
+
+    def _maybe_flip_zone(self, sid: int, feet_y: float):
+        """
+        Actualiza el contador de frames en zona incorrecta para el slot sid.
+        Si el jugador lleva ZONE_FLIP_FRAMES consecutivos claramente en la zona
+        contraria (fuera del buffer), confirma el cambio y actualiza slot_zones.
+        Esto permite detectar cambios de lado entre sets sin configuración manual.
+        """
+        if self.frame_height is None:
+            return
+        net_px = self.frame_height * self.NET_Y
+        buf_px = self.frame_height * self.NET_Y_BUFFER
+
+        if feet_y > net_px + buf_px:
+            raw_zone = "near"
+        elif feet_y < net_px - buf_px:
+            raw_zone = "far"
+        else:
+            # En el buffer: zona ambigua, no contabilizar en ninguna dirección
+            self._zone_wrong_frames[sid] = 0
+            return
+
+        if raw_zone != self.slot_zones[sid]:
+            self._zone_wrong_frames[sid] += 1
+            if self._zone_wrong_frames[sid] >= self.ZONE_FLIP_FRAMES:
+                old = self.slot_zones[sid]
+                self.slot_zones[sid] = raw_zone
+                self._zone_wrong_frames[sid] = 0
+                print(f"[Tracker] Slot {sid} cambia zona {old}→{raw_zone} "
+                      f"(cambio de lado detectado)")
+        else:
+            self._zone_wrong_frames[sid] = 0
 
     def _hist_distance(self, h1, h2) -> float:
         """Chi-cuadrado normalizado entre dos histogramas. 0 = idénticos, 1 = máximos."""
@@ -187,12 +228,14 @@ class Tracker:
                     continue
                 sid = active_slots[c]
                 d   = detections[r]
+                # Actualizar zona adaptativa antes de guardar en el slot
+                self._maybe_flip_zone(sid, d["xyxy"][3])
                 self.slots[sid] = {
                     "last_pos":   d["pos"],
                     "last_frame": frame_count,
                     "yolo_id":    d["id"],
                     "hist":       self._blend_hist(self.slots[sid].get("hist"), d["hist"]),
-                    "zone":       self.slot_zones[sid],  # zona del slot, no del frame actual
+                    "zone":       self.slot_zones[sid],
                 }
                 mapping[d["id"]] = sid
                 assigned_det_indices.add(r)
