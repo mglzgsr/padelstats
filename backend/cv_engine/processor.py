@@ -15,10 +15,10 @@ class SimpleBox:
         self.xyxy = [MockTensor(np.array(xyxy))]
 
 class VideoProcessor:
-    def __init__(self, video_path, output_path):
+    def __init__(self, video_path, output_path, court_config_path=None):
         self.video_path = video_path
         self.output_path = output_path
-        self.court_detector = CourtDetector()
+        self.court_detector = CourtDetector(config_path=court_config_path)
         self.tracker = Tracker()
         self.shot_classifier = ShotClassifier()
         

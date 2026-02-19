@@ -1,15 +1,38 @@
 from __future__ import annotations
 
+import json
+import os
 import cv2
 import numpy as np
 
 
 class CourtDetector:
-    def __init__(self):
+    def __init__(self, config_path: str | None = None):
+        """
+        config_path: ruta al JSON generado por calibrate_court.py.
+            Si existe, el polígono de pista queda fijo (cámara fija).
+            Si no, se detecta automáticamente por color azul cada frame.
+        """
         self.court_lines = None
         # Polígono de pista estabilizado (se actualiza con media exponencial)
         self._stable_polygon = None
-        self._poly_alpha = 0.05  # Actualización lenta: el polígono no salta frame a frame
+        self._poly_alpha = 0.05  # Actualización lenta para la detección automática
+        self._polygon_fixed = False  # True cuando viene de calibración manual
+
+        # Intentar cargar calibración manual
+        if config_path and os.path.exists(config_path):
+            self._load_config(config_path)
+
+    def _load_config(self, config_path: str):
+        """Carga el polígono de pista desde un JSON de calibración."""
+        with open(config_path) as f:
+            config = json.load(f)
+        pts = config.get("court_polygon", [])
+        if len(pts) >= 3:
+            self._stable_polygon = np.array(pts, dtype=np.int32)
+            self._polygon_fixed = True
+            print(f"[CourtDetector] Polígono cargado desde {config_path} "
+                  f"({len(pts)} puntos) — detección automática desactivada.")
 
     # ------------------------------------------------------------------
     # Detección del polígono de pista (suelo azul)
@@ -17,13 +40,14 @@ class CourtDetector:
 
     def detect_court_polygon(self, frame) -> np.ndarray | None:
         """
-        Detecta el contorno de la pista usando el color azul del suelo.
-        Devuelve un polígono np.int32 (N,2) en coordenadas de imagen,
-        o None si no se puede detectar.
-
-        La pista de pádel tiene suelo azul, lo que facilita una segmentación
-        HSV robusta frente al fondo (paredes de cristal, suelo exterior verde).
+        Devuelve el polígono de la pista. Si hay calibración manual (JSON),
+        lo retorna directamente sin procesar el frame. Si no, lo detecta
+        automáticamente por color azul HSV.
         """
+        # Si la calibración es manual, no hay nada que detectar
+        if self._polygon_fixed:
+            return self._stable_polygon
+
         h, w = frame.shape[:2]
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
 
@@ -60,6 +84,15 @@ class CourtDetector:
         epsilon = 0.02 * cv2.arcLength(hull, True)
         polygon = cv2.approxPolyDP(hull, epsilon, True)
         polygon = polygon.reshape(-1, 2).astype(np.float32)
+
+        # Los jugadores cercanos a la cámara están ENTRE la cámara y la pista,
+        # por lo que sus pies aparecen debajo del área azul visible.
+        # Forzamos que el polígono siempre incluya las esquinas inferiores del frame
+        # para que nunca se excluya a los jugadores del lado cercano.
+        bottom_corners = np.array([[0, h - 1], [w - 1, h - 1]], dtype=np.float32)
+        polygon = np.vstack([polygon, bottom_corners])
+        hull_extended = cv2.convexHull(polygon.astype(np.float32))
+        polygon = hull_extended.reshape(-1, 2).astype(np.float32)
 
         # Estabilizar el polígono con media exponencial para evitar saltos
         if self._stable_polygon is None or len(self._stable_polygon) != len(polygon):

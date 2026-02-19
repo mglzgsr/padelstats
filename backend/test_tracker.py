@@ -23,7 +23,7 @@ fourcc = cv2.VideoWriter_fourcc(*'mp4v')
 out = cv2.VideoWriter(VIDEO_OUT, fourcc, fps, (w, h))
 
 tracker = Tracker(model_path="yolov8n.pt", ball_model_path="tennis_ball_best.pt")
-court_d = CourtDetector()
+court_d = CourtDetector(config_path="court_config.json")
 
 # Polígono inicial de respaldo (trapecio fijo) hasta que court_d detecte el azul
 top_y_court = int(h * 0.45)
