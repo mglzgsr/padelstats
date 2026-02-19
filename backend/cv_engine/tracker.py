@@ -289,14 +289,15 @@ class Tracker:
     # ------------------------------------------------------------------
 
     def track_frame(self, frame, frame_count: int = 0,
-                    court_polygon: np.ndarray | None = None) -> dict:
+                    court_polygon: np.ndarray | None = None,
+                    run_ball: bool = True,
+                    run_far_zone: bool = True) -> dict:
         """
-        court_polygon: polígono np.int32 (N,2) que define la zona de juego.
-            Si se pasa, las detecciones con pies fuera del polígono se ignoran
-            antes de la asignación de slots (evita que espectadores/árbitros
-            reciban un ID de jugador).
+        court_polygon : polígono np.int32 (N,2) que define la zona de juego.
+        run_ball      : ejecutar detección de pelota en este frame (frame skipping).
+        run_far_zone  : ejecutar el segundo pase de zona lejana (más costoso).
         """
-        # Detección de personas
+        # Detección de personas — siempre, necesario para continuidad de IDs
         person_results = self.model_persons.track(
             frame, persist=True, classes=[0], conf=0.25, verbose=False
         )[0]
@@ -306,7 +307,6 @@ class Tracker:
             detections = []
             for i, yolo_id in enumerate(person_results.boxes.id.cpu().numpy()):
                 xyxy = person_results.boxes.xyxy[i].cpu().numpy()
-                # Filtro de polígono: solo jugadores con pies dentro de la cancha
                 if court_polygon is not None:
                     feet = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
                     if cv2.pointPolygonTest(court_polygon, feet, False) < 0:
@@ -318,18 +318,23 @@ class Tracker:
 
         person_results.slot_mapping = mapping
 
-        # --- Detección de pelota en dos pasadas ---
-        # Pasada 1: frame completo (coge pelotas cercanas y en trayectoria)
-        ball_results = self.model_ball.track(frame, persist=True, conf=0.10, verbose=False)[0]
+        # --- Detección de pelota con frame skipping ---
+        if run_ball:
+            ball_results = self.model_ball.track(
+                frame, persist=True, conf=0.10, verbose=False
+            )[0]
+        else:
+            ball_results = None
 
-        # Pasada 2: zona lejana ampliada 2× (pelota pequeña a distancia)
-        # Recortamos desde arriba hasta ligeramente por debajo de la red.
-        ball_far_detections = self._detect_ball_far_zone(frame)
+        if run_far_zone and run_ball:
+            ball_far_detections = self._detect_ball_far_zone(frame)
+        else:
+            ball_far_detections = []
 
         return {
-            "person_results": person_results,
-            "ball_results": ball_results,
-            "ball_far_detections": ball_far_detections,  # [(x1,y1,x2,y2,conf), ...]
+            "person_results":     person_results,
+            "ball_results":       ball_results,
+            "ball_far_detections": ball_far_detections,
         }
 
     # Fracción del frame que se ignora por arriba (focos, techo).

@@ -34,6 +34,7 @@ interface BackendResult {
   filename?: string;
   status: string;
   total_frames: number;
+  processed_frames: number;
   shots_count: number;
   player_stats: Record<string, PlayerStat>;
   events: ShotEvent[];
@@ -189,7 +190,7 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
 
   const fetchResults = useCallback(async () => {
     try {
-      const res = await fetch(`http://127.0.0.1:8000/results/${id}`);
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/results/${id}`);
       if (!res.ok) throw new Error(`Error ${res.status}`);
       const json: BackendResult = await res.json();
       setData(json);
@@ -221,6 +222,11 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
       </div>
     );
   }
+
+  const retryAnalysis = async () => {
+    await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze/${id}`, { method: "POST" });
+    fetchResults();
+  };
 
   if (error || !data) {
     return (
@@ -262,16 +268,43 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
               {isProcessing && <span className="w-2 h-2 rounded-full bg-sky-400 animate-pulse inline-block" />}
               {data.status.toUpperCase()}
             </div>
+            {data.status === "error" && (
+              <button
+                onClick={retryAnalysis}
+                className="mt-1 text-xs text-sky-400 hover:text-sky-300 underline underline-offset-2"
+              >
+                Reintentar
+              </button>
+            )}
           </div>
           {/* Total shots */}
           <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl px-4 py-2 text-center">
             <div className="text-xs text-slate-500 uppercase font-semibold mb-0.5">Total golpes</div>
             <div className="text-2xl font-black text-white">{data.shots_count}</div>
           </div>
-          {/* Frames */}
-          <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl px-4 py-2 text-center">
-            <div className="text-xs text-slate-500 uppercase font-semibold mb-0.5">Frames</div>
-            <div className="text-2xl font-black text-white">{data.total_frames.toLocaleString()}</div>
+          {/* Frames / Progreso */}
+          <div className="bg-slate-800/60 border border-slate-700/50 rounded-xl px-4 py-2 text-center min-w-[140px]">
+            <div className="text-xs text-slate-500 uppercase font-semibold mb-0.5">
+              {isProcessing ? "Progreso" : "Frames"}
+            </div>
+            {isProcessing && data.total_frames > 0 ? (
+              <>
+                <div className="text-sm font-black text-white">
+                  {Math.round((data.processed_frames / data.total_frames) * 100)}%
+                </div>
+                <div className="mt-1 h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-sky-500 rounded-full transition-all duration-1000"
+                    style={{ width: `${(data.processed_frames / data.total_frames) * 100}%` }}
+                  />
+                </div>
+                <div className="text-xs text-slate-600 mt-0.5">
+                  {data.processed_frames.toLocaleString()} / {data.total_frames.toLocaleString()}
+                </div>
+              </>
+            ) : (
+              <div className="text-2xl font-black text-white">{data.total_frames.toLocaleString()}</div>
+            )}
           </div>
         </div>
       </header>

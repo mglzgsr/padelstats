@@ -76,14 +76,28 @@ class AnalysisService:
                 court_config_path=court_config if os.path.exists(court_config) else None
             )
             
-            # 4. Run Analysis with real-time callback
-            print("DEBUG: Executing processor.process()...")
-            processor.process(on_event=save_shot_realtime)
-            print("DEBUG: processor.process() finished.")
+            # 4. Fijar total_frames al inicio para mostrar progreso correcto
+            import cv2 as _cv2
+            _cap = _cv2.VideoCapture(abs_file_path)
+            video.total_frames = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+            _cap.release()
+            db.commit()
 
-            # 5. Finalize status
+            # 5. Run Analysis con callbacks de evento y progreso
+            def save_progress(current: int, total: int):
+                try:
+                    video.processed_frames = current
+                    db.commit()
+                except Exception:
+                    db.rollback()
+
+            print(f"Iniciando análisis de {video.total_frames} frames…")
+            processor.process(on_event=save_shot_realtime, on_progress=save_progress)
+            print("Análisis finalizado.")
+
+            # 6. Finalize status
             video.status = "completed"
-            video.total_frames = processor.stats["total_frames"]
+            video.processed_frames = video.total_frames
             video.processed_at = datetime.utcnow()
             db.commit()
             print(f"DEBUG: Analysis for {video_id} successful.")

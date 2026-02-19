@@ -15,6 +15,12 @@ class SimpleBox:
         self.xyxy = [MockTensor(np.array(xyxy))]
 
 class VideoProcessor:
+    # Frecuencia de muestreo para detección de pelota.
+    # La pelota se detecta cada BALL_SKIP frames; entre medias se usa interpolación.
+    # Person tracking corre cada frame para mantener continuidad de IDs.
+    BALL_SKIP     = 2   # detectar pelota 1 de cada 2 frames  (~2x speedup en ball)
+    FAR_ZONE_SKIP = 3   # zona lejana amplificada 1 de cada 3 (~3x speedup en far)
+
     def __init__(self, video_path, output_path, court_config_path=None):
         self.video_path = video_path
         self.output_path = output_path
@@ -44,16 +50,23 @@ class VideoProcessor:
         self.max_missed_frames = 30  # 15→30: cubre 0.5s a 60fps (antes 0.25s)
         self.trajectories = [] # List of lists: [[(x,y,f), ...], ...]
 
-    def process(self, on_event=None):
+    def process(self, on_event=None, on_progress=None):
+        """
+        on_event(event_data)        — callback por cada golpe detectado
+        on_progress(current, total) — callback cada 60 frames con el progreso
+        """
         cap = cv2.VideoCapture(self.video_path)
         if not cap.isOpened():
             print(f"Error opening video file {self.video_path}")
             return
 
         # Video properties
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fps = int(cap.get(cv2.CAP_PROP_FPS))
+        fps    = int(cap.get(cv2.CAP_PROP_FPS))
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.stats["total_video_frames"] = total_frames
+        print(f"Video: {width}x{height} @ {fps}fps — {total_frames} frames totales")
         
         # Output writer
         os.makedirs(os.path.dirname(self.output_path), exist_ok=True)
@@ -84,19 +97,23 @@ class VideoProcessor:
             if not ret:
                 break
 
-            # 1. Detect Court Lines + actualizar polígono si la detección no es fija
-            detected_poly = self.court_detector.detect_court_polygon(frame)
-            if detected_poly is not None:
-                court_polygon = detected_poly
+            # 1. Líneas de cancha (fijas si hay calibración, sin coste por frame)
             court_lines = self.court_detector.detect(frame)
             if court_lines is not None:
                 self.stats["court_detected"] += 1
 
-            # 2. Track Objects (solo jugadores dentro de la cancha)
-            track_results = self.tracker.track_frame(frame, frame_count, court_polygon=court_polygon)
+            # 2. Track + detección de pelota con frame skipping
+            run_ball     = (frame_count % self.BALL_SKIP     == 0)
+            run_far_zone = (frame_count % self.FAR_ZONE_SKIP == 0)
+            track_results  = self.tracker.track_frame(
+                frame, frame_count,
+                court_polygon=court_polygon,
+                run_ball=run_ball,
+                run_far_zone=run_far_zone,
+            )
             person_results = track_results["person_results"]
-            ball_results = track_results["ball_results"]
-            ball_far = track_results.get("ball_far_detections", [])
+            ball_results   = track_results["ball_results"]       # None si skipped
+            ball_far       = track_results.get("ball_far_detections", [])
 
             # Update stats
             # Person detections
@@ -105,9 +122,9 @@ class VideoProcessor:
                 self.stats["players_detected"] += 1
 
             # --- Construir lista unificada de candidatos a pelota ---
-            # Combina detecciones del frame completo + zona lejana amplificada
+            # ball_results puede ser None si el frame fue skipped
             ball_candidates = []  # [(x1, y1, x2, y2, conf)]
-            if ball_results and ball_results.boxes:
+            if ball_results is not None and ball_results.boxes:
                 for box in ball_results.boxes:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf[0].cpu().numpy())
@@ -366,8 +383,10 @@ class VideoProcessor:
             out.write(annotated_frame)
             frame_count += 1
             self.stats["total_frames"] += 1
-            if frame_count % 30 == 0:
-                print(f"Processed {frame_count} frames...")
+            if frame_count % 60 == 0:
+                print(f"  {frame_count}/{total_frames} frames procesados…")
+                if on_progress:
+                    on_progress(frame_count, total_frames)
             
             if frame_count % 300 == 0:
                 cur_total = self.stats["total_frames"] or 1

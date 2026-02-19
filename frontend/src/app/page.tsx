@@ -15,7 +15,7 @@ export default function Home() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch("http://127.0.0.1:8000/videos")
+    fetch(`${process.env.NEXT_PUBLIC_API_URL}/videos`)
       .then((res) => res.json())
       .then((data) => {
         setVideos(data);

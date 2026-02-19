@@ -67,15 +67,24 @@ async def start_analysis(video_id: str, background_tasks: BackgroundTasks, db: S
     video = db.query(VideoRecord).filter(VideoRecord.id == video_id).first()
     if not video:
         raise HTTPException(status_code=404, detail="Video not found")
-    
+
     if video.status == "processing":
         return {"message": "Analysis already in progress", "status": "processing"}
-    
-    # Run in background
+
+    # Limpiar resultados anteriores si es un reintento (status == "error" o "completed")
+    if video.status in ("error", "completed"):
+        db.query(ShotEvent).filter(ShotEvent.video_id == video_id).delete()
+        video.processed_frames = 0
+        video.total_frames = 0
+        db.commit()
+
+    video.status = "processing"
+    db.commit()
+
     file_path = os.path.join(UPLOAD_DIR, f"{video.id}{os.path.splitext(video.filename)[1]}")
     service = AnalysisService(db)
     background_tasks.add_task(service.analyze_video, video.id, file_path)
-    
+
     return {"message": "Analysis started", "video_id": video.id, "status": "processing"}
 
 @app.get("/results/{video_id}")
@@ -104,6 +113,7 @@ def get_results(video_id: str, db: Session = Depends(get_db)):
         "filename": video.filename,
         "status": video.status,
         "total_frames": video.total_frames or 0,
+        "processed_frames": video.processed_frames or 0,
         "shots_count": len(shots),
         "player_stats": player_stats,
         "events": shots

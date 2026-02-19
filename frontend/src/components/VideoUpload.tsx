@@ -50,7 +50,7 @@ export const VideoUpload = () => {
 
         try {
             const xhr = new XMLHttpRequest();
-            xhr.open('POST', 'http://localhost:8000/upload', true);
+            xhr.open('POST', `${process.env.NEXT_PUBLIC_API_URL}/upload`, true);
 
             xhr.upload.onprogress = (e) => {
                 if (e.lengthComputable) {
@@ -66,7 +66,7 @@ export const VideoUpload = () => {
 
                     // Trigger analysis automatically
                     try {
-                        const analyzeRes = await fetch(`http://localhost:8000/analyze/${result.id}`, { method: 'POST' });
+                        const analyzeRes = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze/${result.id}`, { method: 'POST' });
                         if (analyzeRes.ok) {
                             // Redirect to dashboard
                             window.location.href = `/dashboard/${result.id}`;
