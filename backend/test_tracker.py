@@ -25,14 +25,15 @@ out = cv2.VideoWriter(VIDEO_OUT, fourcc, fps, (w, h))
 tracker = Tracker(model_path="yolov8n.pt", ball_model_path="tennis_ball_best.pt")
 court_d = CourtDetector()
 
-# Polígono de la cancha (mismo que processor.py) — filtra jugadores fuera de pista
+# Polígono inicial de respaldo (trapecio fijo) hasta que court_d detecte el azul
 top_y_court = int(h * 0.45)
-court_polygon = np.array([
+fallback_polygon = np.array([
     [int(w * 0.25), top_y_court],
     [int(w * 0.75), top_y_court],
     [w, h],
     [0, h]
 ], np.int32)
+court_polygon = fallback_polygon  # Se reemplaza frame a frame con el detectado
 
 colors = {1: (255, 80, 80), 2: (80, 80, 255), 3: (80, 255, 80), 4: (255, 255, 80), 0: (150, 150, 150)}
 
@@ -48,6 +49,11 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
     if not ret:
         break
 
+    # Detectar polígono de pista por color azul (actualiza el polígono para el próximo frame)
+    detected_poly = court_d.detect_court_polygon(frame)
+    if detected_poly is not None:
+        court_polygon = detected_poly
+
     results   = tracker.track_frame(frame, frame_count, court_polygon=court_polygon)
     p_results = results["person_results"]
     mapping   = p_results.slot_mapping if hasattr(p_results, "slot_mapping") else {}
@@ -60,8 +66,9 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
     cv2.putText(ann, f"RED (NET_Y={tracker.NET_Y})", (20, net_y - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
-    # Polígono de cancha: solo en modo debug, línea fina gris
-    cv2.polylines(ann, [court_polygon], True, (80, 80, 80), 1)
+    # Polígono de pista detectado (azul cian = detectado por color, gris = fallback)
+    poly_color = (0, 220, 220) if detected_poly is not None else (80, 80, 80)
+    cv2.polylines(ann, [court_polygon], True, poly_color, 2)
 
     if p_results.boxes and p_results.boxes.id is not None:
         boxes_raw = p_results.boxes.xyxy.cpu().numpy()
