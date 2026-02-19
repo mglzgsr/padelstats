@@ -101,8 +101,9 @@ def get_results(video_id: str, db: Session = Depends(get_db)):
 
     return {
         "video_id": video_id,
+        "filename": video.filename,
         "status": video.status,
-        "total_frames": video.total_frames,
+        "total_frames": video.total_frames or 0,
         "shots_count": len(shots),
         "player_stats": player_stats,
         "events": shots
