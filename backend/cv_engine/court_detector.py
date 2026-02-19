@@ -127,61 +127,141 @@ class CourtDetector:
 
     def detect(self, frame, debug=False):
         """
-        Detecta las 3 líneas internas principales: 2 horizontales + 1 vertical central.
-        Usa el polígono azul como ROI para limitar la búsqueda al suelo de la pista.
+        Detecta las líneas internas de la pista: líneas de servicio (horizontales),
+        línea central de saque (vertical) y bandas laterales (diagonales).
+        Los segmentos Hough se fusionan por regresión lineal para obtener
+        líneas limpias y extendidas en lugar de decenas de trozos cortos.
         """
         h, w = frame.shape[:2]
 
-        # ROI: usar el polígono de pista si está disponible, si no el trapecio fijo
+        # ROI: polígono de pista o trapecio de respaldo
         roi_mask = np.zeros((h, w), dtype=np.uint8)
         if self._stable_polygon is not None:
             cv2.fillPoly(roi_mask, [self._stable_polygon], 255)
         else:
-            top_y = int(h * 0.55)
+            top_y = int(h * 0.50)
             pts = np.array([
-                [int(w * 0.2), top_y], [int(w * 0.8), top_y], [w, h], [0, h]
+                [int(w * 0.15), top_y], [int(w * 0.85), top_y], [w, h], [0, h]
             ], np.int32)
             cv2.fillPoly(roi_mask, [pts], 255)
 
         # Máscara HSV para líneas blancas
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        lower_white = np.array([0, 0, 185])
-        upper_white = np.array([180, 45, 255])
+        lower_white = np.array([0, 0, 180])
+        upper_white = np.array([180, 50, 255])
         white_mask = cv2.inRange(hsv, lower_white, upper_white)
         combined_mask = cv2.bitwise_and(white_mask, white_mask, mask=roi_mask)
 
-        # Morfología
+        # Morfología: dilatar para conectar trozos interrumpidos por la perspectiva
         kernel = np.ones((3, 3), np.uint8)
-        combined_mask = cv2.dilate(combined_mask, kernel, iterations=1)
+        combined_mask = cv2.dilate(combined_mask, kernel, iterations=2)
         combined_mask = cv2.erode(combined_mask, kernel, iterations=1)
 
-        # Hough Lines
-        lines = cv2.HoughLinesP(
+        # Hough — umbral más bajo y gap mayor para capturar líneas parciales
+        raw_lines = cv2.HoughLinesP(
             combined_mask, 1, np.pi / 180,
-            threshold=80, minLineLength=100, maxLineGap=50
+            threshold=60, minLineLength=60, maxLineGap=80
         )
 
-        if lines is not None:
-            final_lines = []
-            for line in lines:
-                x1, y1, x2, y2 = line[0]
-                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+        if raw_lines is None:
+            self.court_lines = None
+            return None
 
-                # Líneas horizontales (líneas de servicio)
-                # Ampliar tolerancia angular: perspectiva hace que no sean exactamente 0°
-                if angle < 20 or angle > 160:
-                    if h * 0.55 < (y1 + y2) / 2 < h * 0.95:
-                        final_lines.append(line)
+        # Clasificar segmentos por tipo de línea
+        h_segs = []   # horizontales (líneas de servicio)
+        v_segs = []   # verticales (centro de saque)
+        d_segs = []   # diagonales (bandas laterales)
 
-                # Línea vertical central (línea de saque)
-                elif 70 < angle < 110:
-                    if w * 0.35 < (x1 + x2) / 2 < w * 0.65:
-                        final_lines.append(line)
+        for seg in raw_lines:
+            x1, y1, x2, y2 = seg[0]
+            angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+            mid_x = (x1 + x2) / 2
+            mid_y = (y1 + y2) / 2
 
-            lines = np.array(final_lines) if final_lines else None
+            if angle < 25 or angle > 155:
+                # Horizontal: líneas de servicio en el área de juego
+                if h * 0.45 < mid_y < h * 0.95:
+                    h_segs.append((x1, y1, x2, y2))
+            elif 65 < angle < 115:
+                # Vertical: línea central de saque, evitar bordes laterales
+                if w * 0.30 < mid_x < w * 0.70:
+                    v_segs.append((x1, y1, x2, y2))
+            elif 25 <= angle <= 65 or 115 <= angle <= 155:
+                # Diagonal: bandas laterales visibles por perspectiva
+                # Solo en los bordes laterales de la pista
+                if mid_x < w * 0.25 or mid_x > w * 0.75:
+                    if h * 0.40 < mid_y < h * 0.90:
+                        d_segs.append((x1, y1, x2, y2))
 
+        # Fusionar segmentos del mismo tipo en líneas limpias
+        final_lines = []
+        # Horizontales: agrupar por Y (± 40px) → máx. 3 líneas
+        for merged in self._cluster_and_merge(h_segs, axis="y", gap=40, max_lines=3):
+            final_lines.append([list(merged)])
+        # Vertical central: máx. 1 línea
+        for merged in self._cluster_and_merge(v_segs, axis="x", gap=60, max_lines=1):
+            final_lines.append([list(merged)])
+        # Bandas laterales: máx. 2 líneas (izquierda + derecha)
+        for merged in self._cluster_and_merge(d_segs, axis="x", gap=80, max_lines=2):
+            final_lines.append([list(merged)])
+
+        lines = np.array(final_lines, dtype=np.int32) if final_lines else None
         self.court_lines = lines
         return lines
+
+    def _cluster_and_merge(self, segs: list, axis: str, gap: int, max_lines: int) -> list:
+        """
+        Agrupa segmentos por proximidad en el eje indicado y fusiona cada grupo
+        en una sola línea extendida mediante regresión lineal.
+        Devuelve lista de (x1, y1, x2, y2) con los mejores max_lines grupos.
+        """
+        if not segs:
+            return []
+
+        # Ordenar por el punto medio del eje de agrupación
+        key_fn = (lambda s: (s[1] + s[3]) / 2) if axis == "y" \
+            else (lambda s: (s[0] + s[2]) / 2)
+        segs = sorted(segs, key=key_fn)
+
+        # Agrupar segmentos consecutivos dentro del gap
+        clusters = []
+        current = [segs[0]]
+        for seg in segs[1:]:
+            if abs(key_fn(seg) - key_fn(current[-1])) <= gap:
+                current.append(seg)
+            else:
+                clusters.append(current)
+                current = [seg]
+        clusters.append(current)
+
+        # Ordenar clusters por número de segmentos (más largo = más fiable)
+        clusters.sort(key=lambda c: len(c), reverse=True)
+
+        merged = []
+        for cluster in clusters[:max_lines]:
+            pts = []
+            for x1, y1, x2, y2 in cluster:
+                pts.extend([(x1, y1), (x2, y2)])
+            pts = np.array(pts, dtype=np.float32)
+
+            xs, ys = pts[:, 0], pts[:, 1]
+            # Regresión lineal: si más dispersión en X → y=f(x), si no → x=f(y)
+            if np.std(xs) >= np.std(ys):
+                if np.std(xs) < 1:
+                    continue
+                m, b = np.polyfit(xs, ys, 1)
+                x1e, x2e = int(xs.min()), int(xs.max())
+                y1e, y2e = int(m * x1e + b), int(m * x2e + b)
+            else:
+                if np.std(ys) < 1:
+                    continue
+                m, b = np.polyfit(ys, xs, 1)
+                y1e, y2e = int(ys.min()), int(ys.max())
+                x1e, x2e = int(m * y1e + b), int(m * y2e + b)
+
+            merged.append((x1e, y1e, x2e, y2e))
+
+        return merged
 
     # ------------------------------------------------------------------
     # Dibujo
@@ -191,9 +271,17 @@ class CourtDetector:
         if lines is None:
             lines = self.court_lines
         if lines is not None:
+            h, w = frame.shape[:2]
             for line in lines:
                 x1, y1, x2, y2 = line[0]
-                cv2.line(frame, (x1, y1), (x2, y2), (0, 255, 0), 3)
+                angle = np.abs(np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi)
+                if angle < 25 or angle > 155:
+                    color = (0, 255, 0)    # verde = horizontal (servicio)
+                elif 65 < angle < 115:
+                    color = (0, 200, 255)  # amarillo = vertical (centro)
+                else:
+                    color = (255, 180, 0)  # azul = banda lateral
+                cv2.line(frame, (x1, y1), (x2, y2), color, 2)
         return frame
 
     def draw_court_polygon(self, frame, color=(0, 200, 255), thickness=2):
