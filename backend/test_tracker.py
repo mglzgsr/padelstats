@@ -132,6 +132,20 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
                 cv2.putText(ann, f"FUERA yolo:{int(yid)}",
                             (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
 
+    # --- Dibujar pelota ---
+    ball_results = results["ball_results"]
+    if ball_results and ball_results.boxes:
+        for box in ball_results.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0].cpu().numpy())
+            cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+            # Recuadro cian para la pelota
+            cv2.rectangle(ann, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
+            cv2.putText(ann, f"ball {conf:.2f}", (int(x1), int(y1) - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+            # Punto central
+            cv2.circle(ann, (cx, cy), 4, (0, 200, 255), -1)
+
     # Líneas de cancha
     court_lines = court_d.detect(frame)
     ann = court_d.draw_lines(ann, court_lines)
