@@ -157,6 +157,29 @@ function ShotTimeline({ events }: { events: ShotEvent[] }) {
   );
 }
 
+// ── Inferir zona real de cada jugador a partir de sus tiros ───────────────────
+// Usa la mediana de pos_y: > 55% del frame = cámara (near), < 55% = fondo (far).
+// Así el layout se reordena automáticamente cuando las parejas cambian de lado.
+function deriveZones(events: ShotEvent[], frameH: number): Record<string, "near" | "far"> {
+  const yBySlot: Record<string, number[]> = {};
+  for (const ev of events) {
+    const k = String(ev.player_id);
+    (yBySlot[k] ??= []).push(ev.pos_y);
+  }
+  const zones: Record<string, "near" | "far"> = {};
+  for (const [k, ys] of Object.entries(yBySlot)) {
+    if (ys.length === 0) continue;
+    const sorted = [...ys].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)];
+    zones[k] = median > frameH * 0.55 ? "near" : "far";
+  }
+  // Fallback para slots sin tiros: convención inicial (1,2=near / 3,4=far)
+  for (const k of ["1", "2", "3", "4"]) {
+    if (!(k in zones)) zones[k] = k === "1" || k === "2" ? "near" : "far";
+  }
+  return zones;
+}
+
 // ── Página principal ───────────────────────────────────────────────────────────
 export default function DashboardPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
@@ -215,6 +238,11 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
   const isProcessing = data.status !== "completed" && data.status !== "error";
   const frameW = 1920, frameH = 1080;  // Resolución por defecto (match.mov)
 
+  // Zonas calculadas a partir de posiciones reales de los tiros
+  const zones = deriveZones(data.events ?? [], frameH);
+  const farSlots  = (["1","2","3","4"] as SlotKey[]).filter(k => zones[k] === "far");
+  const nearSlots = (["1","2","3","4"] as SlotKey[]).filter(k => zones[k] === "near");
+
   return (
     <div className="min-h-screen bg-slate-950 text-white p-6 md:p-10 flex flex-col gap-8 max-w-7xl mx-auto">
 
@@ -251,17 +279,16 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
       {/* ── Grid de jugadores (layout de pista) + lateral ── */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
 
-        {/* Columna izquierda: jugadores dispuestos como en pista */}
+        {/* Columna izquierda: jugadores dispuestos como en pista (zona inferida de tiros) */}
         <div className="lg:col-span-2 flex flex-col gap-4">
-          {/* Indicador de zona */}
           <div className="flex items-center gap-2 text-xs text-slate-600">
             <span>🎾 Fondo (lejos de cámara)</span>
           </div>
 
-          {/* Jugadores del fondo — J3 y J4 */}
+          {/* Jugadores del fondo — orden derivado de posición real */}
           <div className="grid grid-cols-2 gap-4">
-            <PlayerCard slotId="3" stats={ps["3"]} />
-            <PlayerCard slotId="4" stats={ps["4"]} />
+            {farSlots.map(k => <PlayerCard key={k} slotId={k} stats={ps[k]} />)}
+            {farSlots.length === 0 && <p className="col-span-2 text-xs text-slate-600 text-center py-4">Sin datos aún</p>}
           </div>
 
           {/* Separador = red */}
@@ -271,10 +298,10 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
             <div className="flex-1 h-px bg-slate-700" />
           </div>
 
-          {/* Jugadores cercanos — J1 y J2 */}
+          {/* Jugadores cercanos — orden derivado de posición real */}
           <div className="grid grid-cols-2 gap-4">
-            <PlayerCard slotId="1" stats={ps["1"]} />
-            <PlayerCard slotId="2" stats={ps["2"]} />
+            {nearSlots.map(k => <PlayerCard key={k} slotId={k} stats={ps[k]} />)}
+            {nearSlots.length === 0 && <p className="col-span-2 text-xs text-slate-600 text-center py-4">Sin datos aún</p>}
           </div>
 
           <div className="flex items-center gap-2 text-xs text-slate-600">
