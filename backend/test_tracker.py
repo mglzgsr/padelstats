@@ -41,6 +41,12 @@ slot_changes   = {1: 0, 2: 0, 3: 0, 4: 0}
 prev_yolo_ids  = {1: None, 2: None, 3: None, 4: None}
 frame_count    = 0
 
+# Estado de interpolación de pelota (simple, sólo para visualización)
+last_ball_pos   = None   # (cx, cy, frame)
+ball_velocity   = None   # (vx, vy)
+missed_frames   = 0
+MAX_MISSED      = 30
+
 print(f"Procesando primeros {MAX_FRAMES} frames de {VIDEO_IN}...")
 print(f"NET_Y = {tracker.NET_Y}  ({int(h * tracker.NET_Y)}px en un frame de {h}px)")
 
@@ -166,6 +172,51 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
             cv2.putText(ann, f"ball {conf:.2f}", (int(x1), int(y1) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
             cv2.circle(ann, (cx, cy), 4, (0, 200, 255), -1)
+
+    # --- Interpolación visual de pelota ---
+    detected_this_frame = False
+    all_ball_boxes = []
+    if ball_results and ball_results.boxes:
+        for box in ball_results.boxes:
+            x1b, y1b, x2b, y2b = box.xyxy[0].cpu().numpy()
+            if y1b >= h * 0.22:
+                bw, bh = x2b - x1b, y2b - y1b
+                if 2 <= max(bw, bh) <= 55:
+                    all_ball_boxes.append(((x1b + x2b) / 2, (y1b + y2b) / 2))
+    for fx1b, fy1b, fx2b, fy2b, _ in results.get("ball_far_detections", []):
+        if fy1b >= h * 0.22:
+            all_ball_boxes.append(((fx1b + fx2b) / 2, (fy1b + fy2b) / 2))
+
+    if all_ball_boxes:
+        # Tomar la detección más cercana a la última posición
+        best = min(all_ball_boxes, key=lambda p: (
+            ((p[0] - last_ball_pos[0])**2 + (p[1] - last_ball_pos[1])**2)
+            if last_ball_pos else 0
+        ))
+        cx_b, cy_b = int(best[0]), int(best[1])
+        if last_ball_pos:
+            df = frame_count - last_ball_pos[2]
+            if df > 0:
+                ball_velocity = ((cx_b - last_ball_pos[0]) / df,
+                                 (cy_b - last_ball_pos[1]) / df)
+        last_ball_pos = (cx_b, cy_b, frame_count)
+        missed_frames = 0
+        detected_this_frame = True
+
+    if not detected_this_frame:
+        missed_frames += 1
+
+    # Posición interpolada cuando no hay detección
+    if not detected_this_frame and last_ball_pos and ball_velocity:
+        speed = (ball_velocity[0]**2 + ball_velocity[1]**2) ** 0.5
+        if missed_frames <= MAX_MISSED and speed > 1.0:
+            df = frame_count - last_ball_pos[2]
+            px = int(last_ball_pos[0] + ball_velocity[0] * df)
+            py = int(last_ball_pos[1] + ball_velocity[1] * df)
+            if 0 < px < w and 0 < py < h:
+                cv2.circle(ann, (px, py), 10, (0, 165, 255), 2)  # Naranja = interpolada
+                cv2.putText(ann, f"interp ({missed_frames}f)", (px + 12, py),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 165, 255), 1)
 
     # Líneas de cancha
     court_lines = court_d.detect(frame)

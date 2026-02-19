@@ -41,7 +41,7 @@ class VideoProcessor:
         self.last_ball_pos = None # (x, y, frame)
         self.ball_velocity = None # (vx, vy)
         self.missed_ball_frames = 0
-        self.max_missed_frames = 15
+        self.max_missed_frames = 30  # 15→30: cubre 0.5s a 60fps (antes 0.25s)
         self.trajectories = [] # List of lists: [[(x,y,f), ...], ...]
 
     def process(self, on_event=None):
@@ -274,7 +274,7 @@ class VideoProcessor:
             # (antes iba a filtered_ball_boxes y nunca llegaba a shot detection)
             if not trusted_ball_boxes and self.last_ball_pos is not None and self.ball_velocity is not None:
                 speed = np.linalg.norm(self.ball_velocity)
-                if self.missed_ball_frames <= self.max_missed_frames and speed > 3:
+                if self.missed_ball_frames <= self.max_missed_frames and speed > 1.0:
                     lx, ly, lf = self.last_ball_pos
                     vx, vy = self.ball_velocity
                     df = frame_count - lf
@@ -382,7 +382,7 @@ class VideoProcessor:
                 if t_idx in matched_traj_indices: continue
                 last_pos, last_frame = traj[-1][0], traj[-1][1]
                 dt = frame_count - last_frame
-                if dt > 5: continue
+                if dt > 10: continue  # 5→10: tolera gaps de 0.17s a 60fps
                 
                 dist = ((cand_pos[0]-last_pos[0])**2 + (cand_pos[1]-last_pos[1])**2)**0.5
                 if dist < best_dist:
@@ -396,8 +396,8 @@ class VideoProcessor:
                 # Start new possible trajectory
                 self.trajectories.append([(cand_pos, frame_count)])
         
-        # 2. Cleanup old trajectories
-        self.trajectories = [t for t in self.trajectories if (frame_count - t[-1][1]) < 8]
+        # 2. Cleanup old trajectories (alineado con el dt máximo de 10)
+        self.trajectories = [t for t in self.trajectories if (frame_count - t[-1][1]) < 12]
         
         # 3. Find the best validated trajectory (min length 3)
         # A 60fps, 4 frames = 67ms. Bajamos a 3 para detectar pelotas rápidas.
