@@ -132,18 +132,31 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
                 cv2.putText(ann, f"FUERA yolo:{int(yid)}",
                             (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
 
-    # --- Dibujar pelota ---
+    # --- Dibujar pelota (con filtros básicos equivalentes a processor.py) ---
     ball_results = results["ball_results"]
     if ball_results and ball_results.boxes:
         for box in ball_results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0].cpu().numpy())
+
+            # Filtro ROI: ignorar 30% superior (focos, techo)
+            if y1 < h * 0.30:
+                # Mostrar en rojo semi-transparente los que se rechazan por ROI
+                cv2.rectangle(ann, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 180), 1)
+                cv2.putText(ann, "ROI", (int(x1), int(y1) - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 180), 1)
+                continue
+
+            # Filtro tamaño: 2-55px
+            bw, bh = x2 - x1, y2 - y1
+            if max(bw, bh) < 2 or max(bw, bh) > 55:
+                continue
+
             cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
-            # Recuadro cian para la pelota
+            # Recuadro cian = pasa filtros básicos
             cv2.rectangle(ann, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 2)
             cv2.putText(ann, f"ball {conf:.2f}", (int(x1), int(y1) - 6),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-            # Punto central
             cv2.circle(ann, (cx, cy), 4, (0, 200, 255), -1)
 
     # Líneas de cancha

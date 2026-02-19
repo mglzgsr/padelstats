@@ -100,8 +100,8 @@ class VideoProcessor:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
                     conf = box.conf[0].cpu().numpy()
                     
-                    # Filter 1: ROI - Ignore top 20% of frame (ceiling area)
-                    if y1 < height * 0.2:
+                    # Filter 1: ROI - Ignorar el 30% superior (focos, techo, tribuna)
+                    if y1 < height * 0.30:
                         continue
                     
                     center_x = (x1 + x2) / 2
