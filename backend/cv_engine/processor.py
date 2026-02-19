@@ -84,24 +84,47 @@ class VideoProcessor:
             track_results = self.tracker.track_frame(frame, frame_count, court_polygon=court_polygon)
             person_results = track_results["person_results"]
             ball_results = track_results["ball_results"]
-            
+            ball_far = track_results.get("ball_far_detections", [])
+
             # Update stats
             # Person detections
             p_boxes = person_results.boxes
             if p_boxes and len(p_boxes) > 0:
                 self.stats["players_detected"] += 1
-            
-            # --- Ball candidate extraction ---
-            filtered_ball_boxes = []
-            trusted_ball_boxes = [] # Initialize here to prevent NameError
-            
+
+            # --- Construir lista unificada de candidatos a pelota ---
+            # Combina detecciones del frame completo + zona lejana amplificada
+            ball_candidates = []  # [(x1, y1, x2, y2, conf)]
             if ball_results and ball_results.boxes:
                 for box in ball_results.boxes:
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
-                    conf = box.conf[0].cpu().numpy()
+                    conf = float(box.conf[0].cpu().numpy())
+                    ball_candidates.append((x1, y1, x2, y2, conf))
+            # Añadir detecciones de la zona lejana (sin duplicar por IoU > 0.3)
+            for fx1, fy1, fx2, fy2, fconf in ball_far:
+                duplicate = False
+                for cx1, cy1, cx2, cy2, _ in ball_candidates:
+                    ix = max(0, min(fx2, cx2) - max(fx1, cx1))
+                    iy = max(0, min(fy2, cy2) - max(fy1, cy1))
+                    if ix * iy > 0:
+                        area_f = (fx2 - fx1) * (fy2 - fy1)
+                        area_c = (cx2 - cx1) * (cy2 - cy1)
+                        iou = (ix * iy) / (area_f + area_c - ix * iy + 1e-6)
+                        if iou > 0.3:
+                            duplicate = True
+                            break
+                if not duplicate:
+                    ball_candidates.append((fx1, fy1, fx2, fy2, fconf))
+
+            # --- Ball candidate extraction ---
+            filtered_ball_boxes = []
+            trusted_ball_boxes = []
+
+            for x1, y1, x2, y2, conf in ball_candidates:
                     
-                    # Filter 1: ROI - Ignorar el 30% superior (focos, techo, tribuna)
-                    if y1 < height * 0.30:
+                    # Filter 1: ROI - Ignorar el 22% superior (focos a ~15%, techo)
+                    # No subir más: la pelota en el fondo aparece desde ~21% del frame
+                    if y1 < height * 0.22:
                         continue
                     
                     center_x = (x1 + x2) / 2
@@ -203,34 +226,44 @@ class VideoProcessor:
                     if is_static: continue
                     
                     self.ball_history.append((center_x, center_y, frame_count))
-                    if len(self.ball_history) > 30: self.ball_history.pop(0)
-                    
-                    filtered_ball_boxes.append((center_x, center_y, box))
-                
-                # --- Trajectory-Based Validation ---
-                validated_ball = self._validate_trajectories([(cx, cy) for cx, cy, b in filtered_ball_boxes], frame_count)
-                
+                    if len(self.ball_history) > 30:
+                        self.ball_history.pop(0)
+
+                    # Guardar como SimpleBox usando las coords ya disponibles
+                    filtered_ball_boxes.append(
+                        (center_x, center_y,
+                         SimpleBox([x1, y1, x2, y2]))
+                    )
+
+            # --- Trajectory-Based Validation ---
+            if ball_candidates:
+                validated_ball = self._validate_trajectories(
+                    [(cx, cy) for cx, cy, b in filtered_ball_boxes], frame_count
+                )
+
                 if validated_ball:
                     self.stats["ball_detected"] += 1
                     curr_pos = validated_ball
-                    
+
                     if self.last_ball_pos is not None:
                         lx, ly, lf = self.last_ball_pos
                         df = frame_count - lf
                         if df > 0:
-                            self.ball_velocity = ((curr_pos[0] - lx)/df, (curr_pos[1] - ly)/df)
-                    
+                            self.ball_velocity = ((curr_pos[0] - lx) / df,
+                                                  (curr_pos[1] - ly) / df)
+
                     self.last_ball_pos = (curr_pos[0], curr_pos[1], frame_count)
                     self.missed_ball_frames = 0
-                    
-                    # For drawing: use the box associated with this position if available
+
                     for cx, cy, b in filtered_ball_boxes:
                         if abs(cx - curr_pos[0]) < 1 and abs(cy - curr_pos[1]) < 1:
                             trusted_ball_boxes.append(b)
                             break
                     if not trusted_ball_boxes:
-                        # Fallback box if we just have position
-                        trusted_ball_boxes.append(SimpleBox([curr_pos[0]-8, curr_pos[1]-8, curr_pos[0]+8, curr_pos[1]+8]))
+                        trusted_ball_boxes.append(
+                            SimpleBox([curr_pos[0]-8, curr_pos[1]-8,
+                                       curr_pos[0]+8, curr_pos[1]+8])
+                        )
                 else:
                     self.missed_ball_frames += 1
             else:

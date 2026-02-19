@@ -132,6 +132,14 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
                 cv2.putText(ann, f"FUERA yolo:{int(yid)}",
                             (int(x1), int(y1) - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (80, 80, 80), 1)
 
+    # --- Dibujar detecciones extra de zona lejana (magenta) ---
+    for fx1, fy1, fx2, fy2, fconf in results.get("ball_far_detections", []):
+        if fy1 < h * 0.22:
+            continue
+        cv2.rectangle(ann, (int(fx1), int(fy1)), (int(fx2), int(fy2)), (255, 0, 255), 1)
+        cv2.putText(ann, f"far {fconf:.2f}", (int(fx1), int(fy1) - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
     # --- Dibujar pelota (con filtros básicos equivalentes a processor.py) ---
     ball_results = results["ball_results"]
     if ball_results and ball_results.boxes:
@@ -139,8 +147,8 @@ while cap.isOpened() and frame_count < MAX_FRAMES:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0].cpu().numpy())
 
-            # Filtro ROI: ignorar 30% superior (focos, techo)
-            if y1 < h * 0.30:
+            # Filtro ROI: ignorar 22% superior (focos a ~15%, techo)
+            if y1 < h * 0.22:
                 # Mostrar en rojo semi-transparente los que se rechazan por ROI
                 cv2.rectangle(ann, (int(x1), int(y1)), (int(x2), int(y2)), (0, 0, 180), 1)
                 cv2.putText(ann, "ROI", (int(x1), int(y1) - 4),

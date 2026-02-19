@@ -248,13 +248,54 @@ class Tracker:
 
         person_results.slot_mapping = mapping
 
-        # Detección de pelota
+        # --- Detección de pelota en dos pasadas ---
+        # Pasada 1: frame completo (coge pelotas cercanas y en trayectoria)
         ball_results = self.model_ball.track(frame, persist=True, conf=0.10, verbose=False)[0]
+
+        # Pasada 2: zona lejana ampliada 2× (pelota pequeña a distancia)
+        # Recortamos desde arriba hasta ligeramente por debajo de la red.
+        ball_far_detections = self._detect_ball_far_zone(frame)
 
         return {
             "person_results": person_results,
             "ball_results": ball_results,
+            "ball_far_detections": ball_far_detections,  # [(x1,y1,x2,y2,conf), ...]
         }
+
+    def _detect_ball_far_zone(self, frame) -> list:
+        """
+        Segundo pase de detección de pelota sobre la zona lejana de la cancha
+        (por encima de la red) ampliada 2× para mejorar la detección de pelotas
+        pequeñas. Devuelve lista de (x1, y1, x2, y2, conf) en coordenadas
+        originales del frame.
+        """
+        if self.frame_height is None:
+            return []
+
+        net_y = int(self.frame_height * self.NET_Y)
+        # Añadir 15% extra por debajo de la red para no perder pelotas en vuelo
+        crop_bottom = min(int(net_y * 1.15), self.frame_height)
+        crop = frame[:crop_bottom, :]
+
+        if crop.shape[0] < 40:
+            return []
+
+        # Ampliar 2× → la pelota de 3-5px pasa a ser 6-10px (detectable)
+        upscaled = cv2.resize(crop, None, fx=2.0, fy=2.0,
+                              interpolation=cv2.INTER_LINEAR)
+
+        results = self.model_ball(upscaled, conf=0.08, verbose=False)[0]
+        if not results.boxes:
+            return []
+
+        detections = []
+        for box in results.boxes:
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0].cpu().numpy())
+            # Escalar de vuelta a coordenadas originales
+            detections.append((x1 / 2.0, y1 / 2.0, x2 / 2.0, y2 / 2.0, conf))
+
+        return detections
 
     def draw_annotations(self, frame, results):
         return results.plot()
