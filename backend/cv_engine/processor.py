@@ -322,7 +322,7 @@ class VideoProcessor:
                 
                 event_data = self.shot_classifier.classify_shot(impact, player_data)
                 if event_data:
-                    if event_data["event"] == "Shot":
+                    if event_data["event"] == "Shot" and event_data.get("player_id", 0) > 0:
                         self.detected_shots.append(event_data)
                         self.stats["shots_detected"] += 1
                         if on_event:

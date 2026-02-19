@@ -111,7 +111,7 @@ function ShotMap({ events, frameW, frameH }: {
       {/* Puntos de tiros */}
       {events.map((ev) => {
         const slot = String(ev.player_id) as SlotKey;
-        const color = SLOT[slot]?.dot ?? "#94a3b8";
+        const color = (SLOT[slot] ?? SLOT["1"]).dot;
         return (
           <circle
             key={ev.id}
@@ -142,7 +142,7 @@ function ShotTimeline({ events }: { events: ShotEvent[] }) {
       )}
       {recent.map((ev) => {
         const slot = String(ev.player_id) as SlotKey;
-        const s = SLOT[slot];
+        const s = SLOT[slot] ?? SLOT["1"]; // fallback si el player_id no es 1-4
         return (
           <div key={ev.id}
                className={`flex items-center gap-3 rounded-lg px-3 py-2 text-sm border ${s.bg} ${s.border}`}>
