@@ -60,14 +60,23 @@ class VideoProcessor:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
 
-        # Polígono de cancha fijo para todo el video (filtra jugadores fuera de pista)
-        top_y_court = int(height * 0.45)
-        court_polygon = np.array([
-            [int(width * 0.25), top_y_court],
-            [int(width * 0.75), top_y_court],
-            [width, height],
-            [0, height]
-        ], np.int32)
+        # Polígono de cancha: usa calibración del CourtDetector si está disponible,
+        # si no, calcula un trapecio de respaldo con el primer frame.
+        ret0, first_frame = cap.read()
+        if not ret0:
+            cap.release()
+            out.release()
+            return
+        court_polygon = self.court_detector.detect_court_polygon(first_frame)
+        if court_polygon is None:
+            top_y_court = int(height * 0.45)
+            court_polygon = np.array([
+                [int(width * 0.25), top_y_court],
+                [int(width * 0.75), top_y_court],
+                [width, height],
+                [0, height]
+            ], np.int32)
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # Rebobinar al inicio
 
         frame_count = 0
         while cap.isOpened():
@@ -75,7 +84,10 @@ class VideoProcessor:
             if not ret:
                 break
 
-            # 1. Detect Court Lines
+            # 1. Detect Court Lines + actualizar polígono si la detección no es fija
+            detected_poly = self.court_detector.detect_court_polygon(frame)
+            if detected_poly is not None:
+                court_polygon = detected_poly
             court_lines = self.court_detector.detect(frame)
             if court_lines is not None:
                 self.stats["court_detected"] += 1
@@ -322,7 +334,7 @@ class VideoProcessor:
             mapping = person_results.slot_mapping if hasattr(person_results, 'slot_mapping') else {}
             
             # Version header
-            cv2.putText(annotated_frame, "PADEL STATS PRO - v2.2 (Physics Verified)", (w_frame-550, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(annotated_frame, "PADEL STATS PRO - v2.2 (Physics Verified)", (width - 550, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             
             # Slot colors
             colors = {1: (255, 0, 0), 2: (255, 255, 0), 3: (0, 255, 255), 4: (255, 0, 255), 0: (128, 128, 128)}

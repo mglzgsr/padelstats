@@ -262,21 +262,29 @@ class Tracker:
             "ball_far_detections": ball_far_detections,  # [(x1,y1,x2,y2,conf), ...]
         }
 
+    # Fracción del frame que se ignora por arriba (focos, techo).
+    # Debe coincidir con el filtro ROI usado en processor.py / test_tracker.py.
+    ROI_TOP = 0.22
+
     def _detect_ball_far_zone(self, frame) -> list:
         """
         Segundo pase de detección de pelota sobre la zona lejana de la cancha
         (por encima de la red) ampliada 2× para mejorar la detección de pelotas
         pequeñas. Devuelve lista de (x1, y1, x2, y2, conf) en coordenadas
         originales del frame.
+
+        El crop empieza en ROI_TOP (22 %) para excluir los focos del techo
+        antes de ampliar la imagen, evitando falsos positivos.
         """
         if self.frame_height is None:
             return []
 
+        roi_top = int(self.frame_height * self.ROI_TOP)
         net_y = int(self.frame_height * self.NET_Y)
         # Añadir 15% extra por debajo de la red para no perder pelotas en vuelo
         crop_bottom = min(int(net_y * 1.15), self.frame_height)
-        crop = frame[:crop_bottom, :]
 
+        crop = frame[roi_top:crop_bottom, :]
         if crop.shape[0] < 40:
             return []
 
@@ -292,8 +300,14 @@ class Tracker:
         for box in results.boxes:
             x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
             conf = float(box.conf[0].cpu().numpy())
-            # Escalar de vuelta a coordenadas originales
-            detections.append((x1 / 2.0, y1 / 2.0, x2 / 2.0, y2 / 2.0, conf))
+            # Escalar de vuelta a coordenadas originales y sumar el offset del crop
+            detections.append((
+                x1 / 2.0,
+                y1 / 2.0 + roi_top,
+                x2 / 2.0,
+                y2 / 2.0 + roi_top,
+                conf,
+            ))
 
         return detections
 

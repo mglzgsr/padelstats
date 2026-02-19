@@ -70,7 +70,11 @@ class AnalysisService:
             print(f"DEBUG: Output path: {output_path}")
 
             # 3. Initialize Processor
-            processor = VideoProcessor(abs_file_path, output_path)
+            court_config = os.path.join(backend_dir, "court_config.json")
+            processor = VideoProcessor(
+                abs_file_path, output_path,
+                court_config_path=court_config if os.path.exists(court_config) else None
+            )
             
             # 4. Run Analysis with real-time callback
             print("DEBUG: Executing processor.process()...")
