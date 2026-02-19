@@ -1,7 +1,9 @@
 from .cv_engine.processor import VideoProcessor
 from .persistence_models import VideoRecord, ShotEvent, BounceEvent
 from .database import SessionLocal, engine, Base
+from .storage import storage
 import os
+import tempfile
 from datetime import datetime
 
 # Initialize tables
@@ -31,10 +33,11 @@ class AnalysisService:
             db.query(BounceEvent).filter(BounceEvent.video_id == video_id).delete()
             db.commit()
 
-            # Ensure we use absolute path for input
-            abs_file_path = os.path.abspath(file_path)
+            # Descargar el vídeo al sistema local si viene de S3
+            tmp_path = storage.download_tmp(file_path)
+            abs_file_path = os.path.abspath(tmp_path)
             if not os.path.exists(abs_file_path):
-                print(f"DEBUG ERROR: Input file not found at {abs_file_path}")
+                print(f"ERROR: Fichero de vídeo no encontrado en {abs_file_path}")
                 video.status = "error"
                 db.commit()
                 return
@@ -95,12 +98,15 @@ class AnalysisService:
             processor.process(on_event=save_shot_realtime, on_progress=save_progress)
             print("Análisis finalizado.")
 
-            # 6. Finalize status
+            # 6. Limpiar temporal de S3 si aplica
+            storage.cleanup_tmp(tmp_path, file_path)
+
+            # 7. Finalize status
             video.status = "completed"
             video.processed_frames = video.total_frames
             video.processed_at = datetime.utcnow()
             db.commit()
-            print(f"DEBUG: Analysis for {video_id} successful.")
+            print(f"Análisis completado: {video_id}")
 
         except Exception as e:
             db.rollback()

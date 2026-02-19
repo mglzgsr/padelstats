@@ -1,13 +1,16 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 import shutil
 import os
 import uuid
+import tempfile
 from datetime import datetime
 from .database import get_db, engine, Base
 from .persistence_models import VideoRecord, ShotEvent
 from .analysis_service import AnalysisService
+from .storage import storage, BACKEND, LOCAL_DIR
 
 # Initialize DB
 Base.metadata.create_all(bind=engine)
@@ -23,41 +26,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UPLOAD_DIR = "uploaded_videos"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+# Servir ficheros locales solo si el backend es local
+if BACKEND == "local":
+    app.mount("/files", StaticFiles(directory=str(LOCAL_DIR)), name="files")
 
 @app.get("/")
 def read_root():
-    return {"message": "Welcome to Padel Stats API"}
+    return {"message": "Padel Stats API", "storage": BACKEND}
 
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
     if not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
-    
+
     file_id = str(uuid.uuid4())
-    file_extension = os.path.splitext(file.filename)[1]
+    file_extension = os.path.splitext(file.filename or ".mp4")[1]
     filename = f"{file_id}{file_extension}"
-    file_location = os.path.join(UPLOAD_DIR, filename)
-    
+
     try:
-        with open(file_location, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        
-        # Save to DB
+        # Guardar temporalmente y luego mover al backend de storage
+        with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+
+        stored_path = storage.save(tmp_path, filename)
+        os.unlink(tmp_path)
+
         db = next(get_db())
-        db_video = VideoRecord(id=file_id, filename=file.filename)
+        db_video = VideoRecord(id=file_id, filename=file.filename, status="uploaded")
         db.add(db_video)
         db.commit()
         db.close()
-        
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
-        
+
     return {
         "id": file_id,
         "filename": file.filename,
-        "location": file_location,
+        "location": stored_path,
         "status": "uploaded",
         "upload_date": datetime.now().isoformat()
     }

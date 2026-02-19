@@ -1,9 +1,21 @@
 from __future__ import annotations
 
+import os
 from ultralytics import YOLO
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+
+# Dispositivo de inferencia: cuda (GPU NVIDIA) > mps (Apple Silicon) > cpu
+_DEVICE = os.environ.get("TORCH_DEVICE", "")
+if not _DEVICE:
+    import torch
+    if torch.cuda.is_available():
+        _DEVICE = "cuda"
+    elif torch.backends.mps.is_available():
+        _DEVICE = "mps"
+    else:
+        _DEVICE = "cpu"
 
 
 class Tracker:
@@ -35,10 +47,11 @@ class Tracker:
 
     def __init__(self, model_path='yolov8n.pt', ball_model_path='backend/tennis_ball_best.pt'):
         self.model_persons = YOLO(model_path)
-        self.model_persons.to('mps')
+        self.model_persons.to(_DEVICE)
 
         self.model_ball = YOLO(ball_model_path)
-        self.model_ball.to('mps')
+        self.model_ball.to(_DEVICE)
+        print(f"[Tracker] Dispositivo de inferencia: {_DEVICE}")
 
         # Estado de los 4 slots
         # Cada slot: {"last_pos": (x,y), "last_frame": int, "yolo_id": int, "hist": ndarray, "zone": str}
