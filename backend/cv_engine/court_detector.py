@@ -24,15 +24,28 @@ class CourtDetector:
             self._load_config(config_path)
 
     def _load_config(self, config_path: str):
-        """Carga el polígono de pista desde un JSON de calibración."""
+        """Carga el polígono de pista desde un JSON de calibración.
+
+        Las esquinas cercanas a la cámara suelen estar fuera del encuadre,
+        por lo que se añaden automáticamente las esquinas inferiores del frame
+        antes de calcular el casco convexo final.
+        """
         with open(config_path) as f:
             config = json.load(f)
         pts = config.get("court_polygon", [])
-        if len(pts) >= 3:
-            self._stable_polygon = np.array(pts, dtype=np.int32)
-            self._polygon_fixed = True
-            print(f"[CourtDetector] Polígono cargado desde {config_path} "
-                  f"({len(pts)} puntos) — detección automática desactivada.")
+        if len(pts) < 3:
+            return
+
+        w = config.get("frame_width", 1920)
+        h = config.get("frame_height", 1080)
+
+        # Añadir esquinas inferiores del frame para cubrir la zona cercana a cámara
+        all_pts = np.array(pts + [[0, h - 1], [w - 1, h - 1]], dtype=np.float32)
+        hull = cv2.convexHull(all_pts)
+        self._stable_polygon = hull.reshape(-1, 2).astype(np.int32)
+        self._polygon_fixed = True
+        print(f"[CourtDetector] Polígono cargado desde {config_path} "
+              f"({len(pts)} puntos + esquinas inferiores) — detección automática desactivada.")
 
     # ------------------------------------------------------------------
     # Detección del polígono de pista (suelo azul)
