@@ -90,12 +90,9 @@ class TrackNetDetector:
             with open(predict_py) as f:
                 src = f.read()
 
-            # Detectar dispositivo disponible
-            import torch as _torch
-            if _torch.backends.mps.is_available():
-                _device = 'mps'
-            else:
-                _device = 'cpu'
+            # Forzar CPU: MPS puede disparar jetsam (presión de memoria) en macOS
+            # antes de que el modelo siquiera cargue, causando SIGTERM (-15).
+            _device = 'cpu'
 
             patched = src
             # map_location en torch.load
@@ -139,7 +136,17 @@ class TrackNetDetector:
             if self.inpaintnet and os.path.isfile(self.inpaintnet):
                 cmd += ['--inpaintnet_file', self.inpaintnet]
 
-            ret = subprocess.run(cmd, cwd=self.tracknet_dir, capture_output=False)
+            ret = subprocess.run(
+                cmd,
+                cwd=self.tracknet_dir,
+                capture_output=True,       # capturar para debug
+                start_new_session=True,    # aísla del grupo de procesos de uvicorn
+            )
+            # Mostrar siempre stdout/stderr en el log para poder debugar
+            if ret.stdout:
+                print('[TrackNet stdout]', ret.stdout.decode(errors='replace'))
+            if ret.stderr:
+                print('[TrackNet stderr]', ret.stderr.decode(errors='replace'))
             if ret.returncode != 0:
                 print(f'[TrackNet] predict.py falló (returncode={ret.returncode}) — usando YOLO')
                 return {}
