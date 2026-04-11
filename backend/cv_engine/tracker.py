@@ -212,10 +212,10 @@ class Tracker:
 
         # 2. Identificar slots MISSING (jugadores que deberían estar pero no se detectan)
         missing_slots = []
-        for slot, yolo_id in self.yolo_to_player.items():
+        for yolo_id, slot in self.yolo_to_player.items():
             if yolo_id not in current_yolo_ids:
                 # Este jugador no está en las detecciones actuales
-                frames_missing = frame_count - self.last_seen_frame[slot]
+                frames_missing = frame_count - self.last_seen_frame.get(slot, frame_count)
                 if frames_missing <= self.MAX_MISSING_FRAMES:
                     missing_slots.append(slot)
 
