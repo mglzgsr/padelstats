@@ -83,26 +83,45 @@ class TrackNetDetector:
             if on_progress:
                 on_progress('tracknet_scaled', 10)
 
-            # 2. Parchear predict.py para map_location='cpu' (checkpoint guardado en CUDA)
+            # 2. Parchear predict.py para CPU/MPS y copiarlo a /tmp
+            #    (no modificar in-place: uvicorn --reload detectaría el cambio y recargaría)
+            import re as _re
             predict_py = os.path.join(self.tracknet_dir, 'predict.py')
             with open(predict_py) as f:
                 src = f.read()
-            patched = src.replace(
+
+            # Detectar dispositivo disponible
+            import torch as _torch
+            if _torch.backends.mps.is_available():
+                _device = 'mps'
+            else:
+                _device = 'cpu'
+
+            patched = src
+            # map_location en torch.load
+            patched = patched.replace(
                 'torch.load(args.tracknet_file)',
-                "torch.load(args.tracknet_file, map_location='cpu')"
+                f"torch.load(args.tracknet_file, map_location='{_device}')"
             ).replace(
                 'torch.load(args.inpaintnet_file)',
-                "torch.load(args.inpaintnet_file, map_location='cpu')"
+                f"torch.load(args.inpaintnet_file, map_location='{_device}')"
             )
-            if patched != src:
-                with open(predict_py, 'w') as f:
-                    f.write(patched)
-                print('[TrackNet] predict.py parcheado → map_location=cpu')
+            # Reemplazar .cuda() por .to(device)
+            patched = _re.sub(r'\.cuda\(\)', f".to('{_device}')", patched)
+            # Reemplazar device='cuda' o device="cuda"
+            patched = _re.sub(r"device=['\"]cuda['\"]", f"device='{_device}'", patched)
 
-            # 3. Lanzar predict.py
+            # Guardar en /tmp (fuera del directorio vigilado por --reload)
+            patched_predict = os.path.join(tmp, 'predict_patched.py')
+            with open(patched_predict, 'w') as f:
+                f.write(patched)
+            print(f'[TrackNet] predict.py parcheado → device={_device}')
+
+            # 3. Lanzar predict.py parcheado desde /tmp, con cwd=tracknet_dir
+            #    para que los imports relativos de TrackNetV3 funcionen
             print('[TrackNet] Corriendo inferencia...')
             cmd = [
-                sys.executable, 'predict.py',
+                sys.executable, patched_predict,
                 '--video_file',    scaled,
                 '--tracknet_file', self.model_path,
                 '--save_dir',      pred_dir,
