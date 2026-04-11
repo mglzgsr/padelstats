@@ -83,7 +83,23 @@ class TrackNetDetector:
             if on_progress:
                 on_progress('tracknet_scaled', 10)
 
-            # 2. Lanzar predict.py
+            # 2. Parchear predict.py para map_location='cpu' (checkpoint guardado en CUDA)
+            predict_py = os.path.join(self.tracknet_dir, 'predict.py')
+            with open(predict_py) as f:
+                src = f.read()
+            patched = src.replace(
+                'torch.load(args.tracknet_file)',
+                "torch.load(args.tracknet_file, map_location='cpu')"
+            ).replace(
+                'torch.load(args.inpaintnet_file)',
+                "torch.load(args.inpaintnet_file, map_location='cpu')"
+            )
+            if patched != src:
+                with open(predict_py, 'w') as f:
+                    f.write(patched)
+                print('[TrackNet] predict.py parcheado → map_location=cpu')
+
+            # 3. Lanzar predict.py
             print('[TrackNet] Corriendo inferencia...')
             cmd = [
                 sys.executable, 'predict.py',
