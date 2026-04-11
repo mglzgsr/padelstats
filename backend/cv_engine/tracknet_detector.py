@@ -19,6 +19,7 @@ y el sistema cae al detector YOLO como hasta ahora.
 import csv
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Dict, Optional, Tuple
@@ -85,7 +86,7 @@ class TrackNetDetector:
             # 2. Lanzar predict.py
             print('[TrackNet] Corriendo inferencia...')
             cmd = [
-                'python', 'predict.py',
+                sys.executable, 'predict.py',
                 '--video_file',    scaled,
                 '--tracknet_file', self.model_path,
                 '--save_dir',      pred_dir,
