@@ -201,7 +201,7 @@ class Tracker:
         # 1. Actualizar posiciones de jugadores que siguen presentes
         current_yolo_ids = {det["id"] for det in detections_list}
 
-        for slot, yolo_id in self.yolo_to_player.items():
+        for yolo_id, slot in self.yolo_to_player.items():
             if yolo_id in current_yolo_ids:
                 # Este jugador sigue aquí, actualizar su posición
                 det = next(d for d in detections_list if d["id"] == yolo_id)
@@ -294,8 +294,11 @@ class Tracker:
 
             if best_slot is not None:
                 # Re-asignar este nuevo ID al slot faltante
-                old_yolo_id = self.yolo_to_player[best_slot]
-                self.yolo_to_player[best_slot] = new_id
+                # yolo_to_player es {yolo_id: slot} — buscar el yolo_id antiguo del slot
+                old_yolo_id = next((yid for yid, s in self.yolo_to_player.items() if s == best_slot), None)
+                if old_yolo_id is not None:
+                    del self.yolo_to_player[old_yolo_id]
+                self.yolo_to_player[new_id] = best_slot
                 reassignments.append((best_slot, old_yolo_id, new_id, best_distance))
 
                 # Actualizar posición y frame
