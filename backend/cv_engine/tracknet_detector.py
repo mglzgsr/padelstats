@@ -111,6 +111,15 @@ class TrackNetDetector:
             # Reemplazar device='cuda' o device="cuda"
             patched = _re.sub(r"device=['\"]cuda['\"]", f"device='{_device}'", patched)
 
+            # Inyectar sys.path para que los imports relativos de TrackNetV3 funcionen
+            # (Python añade el dir del script a sys.path, no cwd, así que hay que añadirlo explícitamente)
+            path_injection = (
+                f"import sys as _sys\n"
+                f"if {repr(self.tracknet_dir)} not in _sys.path:\n"
+                f"    _sys.path.insert(0, {repr(self.tracknet_dir)})\n"
+            )
+            patched = path_injection + patched
+
             # Guardar en /tmp (fuera del directorio vigilado por --reload)
             patched_predict = os.path.join(tmp, 'predict_patched.py')
             with open(patched_predict, 'w') as f:
