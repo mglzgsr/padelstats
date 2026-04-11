@@ -5,6 +5,8 @@ from ultralytics import YOLO
 import cv2
 import numpy as np
 from scipy.optimize import linear_sum_assignment
+import supervision as sv
+from .ball_tracker import BallTracker
 
 # Dispositivo de inferencia: cuda (GPU NVIDIA) > mps (Apple Silicon) > cpu
 _DEVICE = os.environ.get("TORCH_DEVICE", "")
@@ -35,52 +37,283 @@ class Tracker:
     jugadores del fondo nunca cruzan la red, por lo que este límite es fiable.
     """
 
-    # Posición de la red como fracción de la altura del frame.
-    # Los pies de los jugadores lejanos siempre quedan por encima de este valor.
-    # Ajustar según el ángulo de cámara de tu cancha (típico cámara fondo: 0.60-0.68).
-    NET_Y = 0.63
-
     # Buffer alrededor de la red (fracción de altura).
     # Un jugador dentro del buffer se considera "zona ambigua": no se penaliza
     # por cruzar zona, evitando swaps cuando se acerca a la red.
     NET_Y_BUFFER = 0.05  # ±54px en 1080p
 
-    def __init__(self, model_path='yolov8n.pt', ball_model_path='backend/tennis_ball_best.pt'):
+    def __init__(self, model_path='yolov8l.pt', ball_model_path='backend/tennis_ball_roboflow_v2.pt', net_y_fraction=None):
+        print(f"[Tracker] Cargando modelo YOLO: {model_path}")
         self.model_persons = YOLO(model_path)
         self.model_persons.to(_DEVICE)
+        print(f"[Tracker] Modelo cargado - Parámetros: {sum(p.numel() for p in self.model_persons.model.parameters())/1e6:.1f}M")
 
-        self.model_ball = YOLO(ball_model_path)
-        self.model_ball.to(_DEVICE)
+        if ball_model_path and os.path.isfile(ball_model_path):
+            print(f"[Tracker] Cargando modelo BALL: {ball_model_path}")
+            self.model_ball = YOLO(ball_model_path)
+            self.model_ball.to(_DEVICE)
+            print(f"[Tracker] Modelo BALL cargado - Parámetros: {sum(p.numel() for p in self.model_ball.model.parameters())/1e6:.1f}M")
+        else:
+            print(f"[Tracker] Modelo BALL no encontrado ({ball_model_path}) — detección de pelota delegada a TrackNetV3")
+            self.model_ball = None
+
+        # Posición de la red como fracción de la altura del frame.
+        # Si se proporciona net_y_fraction (de court_config.json), se usa ese valor.
+        # De lo contrario, se usa un valor por defecto (típico cámara fondo: 0.60-0.68).
+        self.NET_Y = net_y_fraction if net_y_fraction is not None else 0.63
         print(f"[Tracker] Dispositivo de inferencia: {_DEVICE}")
+        print(f"[Tracker] NET_Y configurado en {self.NET_Y:.3f}")
 
-        # Estado de los 4 slots
-        # Cada slot: {"last_pos": (x,y), "last_frame": int, "yolo_id": int, "hist": ndarray, "zone": str}
-        self.slots = {1: None, 2: None, 3: None, 4: None}
+        # ========== Supervision ByteTrack (como padel_analytics) ==========
+        print(f"[Tracker] Inicializando Supervision ByteTrack...")
+        # IMPORTANTE: Inicializar después porque necesita fps del video
+        self.byte_tracker = None  # Se inicializará en el primer frame
+        print(f"[Tracker] Supervision ByteTrack - usando defaults como padel_analytics")
 
-        # Zona actual de cada slot: near (cámara) o far (fondo).
-        # Se inicializa con la distribución por defecto pero se adapta automáticamente
-        # si un jugador lleva suficientes frames consecutivos en la zona contraria
-        # (p.ej. cambio de lado entre sets).
-        self.slot_zones = {1: "near", 2: "near", 3: "far", 4: "far"}
+        # ========== NUEVO SISTEMA: Mapeo permanente YOLO ID → Player Slot ==========
+        # En lugar de reasignar slots por posición, mantenemos asignación inicial
+        self.yolo_to_player = {}  # {yolo_id: player_slot} ej: {5: 1, 12: 2, 23: 3, 45: 4}
+        self.initialized = False  # Flag: ¿ya asignamos J1-J4?
 
-        # Contador de frames consecutivos en zona "equivocada" por slot.
-        # Cuando supera ZONE_FLIP_FRAMES, se confirma el cambio de zona.
-        self._zone_wrong_frames = {1: 0, 2: 0, 3: 0, 4: 0}
-        # Frames consecutivos necesarios para confirmar un cambio de zona.
-        # ~2s a 60fps: cubre cambio de lado pero no aproximaciones a la red.
-        self.ZONE_FLIP_FRAMES = 120
+        # ========== Ball Tracker con Kalman Filter e interpolación ==========
+        self.ball_tracker = None  # Se inicializará con fps del video
+        print(f"[Tracker] Ball Tracker con interpolación: Pendiente (se inicializa con fps)")
+        self.initialization_buffer = []  # Buffer de detecciones para inicialización robusta
+        self.INIT_FRAMES = 30  # Frames para analizar antes de asignar J1-J4
 
-        self.max_lost_frames = 300   # ~10 segundos a 30fps
-        self.max_distance = 250      # píxeles máximos entre frames consecutivos
-
-        # Peso del histograma nuevo en la media exponencial (EWA)
-        # Bajo = memoria larga, conservador. Alto = adaptación rápida.
-        self.hist_alpha = 0.25
+        # ========== SISTEMA DE MEMORIA TEMPORAL (Re-asignación inteligente) ==========
+        # Recordar última posición conocida y último frame visto de cada slot
+        self.last_position = {1: None, 2: None, 3: None, 4: None}  # {slot: (x, y)}
+        self.last_seen_frame = {1: -999, 2: -999, 3: -999, 4: -999}  # {slot: frame_count}
+        self.POSITION_THRESHOLD = 400  # pixels - más permisivo (era 250)
+        self.MAX_MISSING_FRAMES = 300  # ~10 seg a 30fps (era 90)
 
         self.frame_height = None  # Se asigna al primer frame
 
     # ------------------------------------------------------------------
-    # Utilidades privadas
+    # Inicialización de jugadores (primeros frames)
+    # ------------------------------------------------------------------
+
+    def _initialize_players(self, detections, frame):
+        """
+        Asigna J1-J4 basándose en posición inicial de los jugadores.
+        Se ejecuta una sola vez al inicio del video.
+
+        Lógica de asignación FLEXIBLE:
+        - Ordena 4 jugadores por posición Y (pies)
+        - 2 más alejados (Y menor) → J3, J4 (zona far)
+        - 2 más cercanos (Y mayor) → J1, J2 (zona near)
+        - Dentro de cada pareja, ordena por X (izq/der)
+        """
+        try:
+            print(f"[Tracker INIT] ===== INICIANDO INICIALIZACIÓN =====")
+            print(f"[Tracker INIT] Número de detecciones recibidas: {len(detections)}")
+
+            if len(detections) != 4:
+                print(f"[Tracker INIT DEBUG] ❌ Solo {len(detections)} jugadores - necesitamos 4")
+                return False  # Necesitamos exactamente 4 jugadores para inicializar
+
+            # Extraer info de jugadores
+            print(f"[Tracker INIT] Extrayendo información de jugadores...")
+            players = []
+            for i, det in enumerate(detections):
+                yolo_id = det["id"]
+                xyxy = det["xyxy"]
+                feet_y = xyxy[3]  # Coordenada Y de los pies (mayor = más cerca de cámara)
+                center_x = (xyxy[0] + xyxy[2]) / 2
+                players.append({"yolo_id": yolo_id, "x": center_x, "y": feet_y})
+                print(f"[Tracker INIT]   Detección {i}: YOLO_ID={yolo_id}, X={center_x:.1f}, Y={feet_y:.1f}")
+
+            # Ordenar por Y (de menor a mayor = de fondo a cerca)
+            print(f"[Tracker INIT] Ordenando por Y (menor=lejos, mayor=cerca)...")
+            players.sort(key=lambda p: p["y"])
+            for i, p in enumerate(players):
+                print(f"[Tracker INIT]   Posición {i}: YOLO_ID={p['yolo_id']}, Y={p['y']:.1f}")
+
+            # Los 2 primeros (Y menor) son zona FAR
+            # Los 2 últimos (Y mayor) son zona NEAR
+            far_players = players[:2]
+            near_players = players[2:]
+            print(f"[Tracker INIT] Dividiendo en zonas:")
+            print(f"[Tracker INIT]   FAR:  IDs {[p['yolo_id'] for p in far_players]}")
+            print(f"[Tracker INIT]   NEAR: IDs {[p['yolo_id'] for p in near_players]}")
+
+            # Ordenar cada grupo por X (izquierda a derecha)
+            print(f"[Tracker INIT] Ordenando cada zona por X (izq→der)...")
+            far_players.sort(key=lambda p: p["x"])
+            near_players.sort(key=lambda p: p["x"])
+            print(f"[Tracker INIT]   FAR ordenado:  IDs {[p['yolo_id'] for p in far_players]}")
+            print(f"[Tracker INIT]   NEAR ordenado: IDs {[p['yolo_id'] for p in near_players]}")
+
+            # Asignar slots
+            print(f"[Tracker INIT] Asignando slots...")
+            self.yolo_to_player[near_players[0]["yolo_id"]] = 1  # J1: near-izq
+            print(f"[Tracker INIT]   J1 (near-izq) = YOLO_ID {near_players[0]['yolo_id']}")
+
+            self.yolo_to_player[near_players[1]["yolo_id"]] = 2  # J2: near-der
+            print(f"[Tracker INIT]   J2 (near-der) = YOLO_ID {near_players[1]['yolo_id']}")
+
+            self.yolo_to_player[far_players[0]["yolo_id"]] = 3   # J3: far-izq
+            print(f"[Tracker INIT]   J3 (far-izq)  = YOLO_ID {far_players[0]['yolo_id']}")
+
+            self.yolo_to_player[far_players[1]["yolo_id"]] = 4   # J4: far-der
+            print(f"[Tracker INIT]   J4 (far-der)  = YOLO_ID {far_players[1]['yolo_id']}")
+
+            print(f"[Tracker] ✅ Jugadores inicializados:")
+            print(f"  J1 (near-izq): YOLO ID {near_players[0]['yolo_id']} @ Y={near_players[0]['y']:.0f}, X={near_players[0]['x']:.0f}")
+            print(f"  J2 (near-der): YOLO ID {near_players[1]['yolo_id']} @ Y={near_players[1]['y']:.0f}, X={near_players[1]['x']:.0f}")
+            print(f"  J3 (far-izq):  YOLO ID {far_players[0]['yolo_id']} @ Y={far_players[0]['y']:.0f}, X={far_players[0]['x']:.0f}")
+            print(f"  J4 (far-der):  YOLO ID {far_players[1]['yolo_id']} @ Y={far_players[1]['y']:.0f}, X={far_players[1]['x']:.0f}")
+            print(f"[Tracker INIT] Diccionario yolo_to_player: {self.yolo_to_player}")
+
+            self.initialized = True
+            print(f"[Tracker INIT] ===== INICIALIZACIÓN COMPLETADA =====")
+            return True
+
+        except Exception as e:
+            print(f"[Tracker INIT ERROR] ❌ Excepción durante inicialización:")
+            print(f"[Tracker INIT ERROR]   Tipo: {type(e).__name__}")
+            print(f"[Tracker INIT ERROR]   Mensaje: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def _reassign_missing_players(self, detections_list, frame_count):
+        """
+        Sistema de memoria temporal con re-asignación inteligente de IDs.
+
+        Lógica:
+        1. Actualizar última posición de jugadores conocidos que siguen presentes
+        2. Detectar qué slots (J1-J4) están MISSING en este frame
+        3. Detectar IDs nuevos (no asignados a ningún slot)
+        4. Para cada ID nuevo, buscar el slot missing más cercano por posición
+        5. Si la distancia es razonable, re-asignar ese ID al slot
+
+        Esto permite que si J1 sale del encuadre (pierde ID=5) y vuelve con ID=45,
+        el sistema detecte que:
+        - Falta J1
+        - ID=45 está cerca de la última posición de J1
+        - Re-asigna: J1 → ID=45
+        """
+        if frame_count % 100 == 0:
+            print(f"[Tracker ReID DEBUG] Frame {frame_count}: _reassign_missing_players llamado con {len(detections_list)} detecciones")
+
+        # 1. Actualizar posiciones de jugadores que siguen presentes
+        current_yolo_ids = {det["id"] for det in detections_list}
+
+        for slot, yolo_id in self.yolo_to_player.items():
+            if yolo_id in current_yolo_ids:
+                # Este jugador sigue aquí, actualizar su posición
+                det = next(d for d in detections_list if d["id"] == yolo_id)
+                xyxy = det["xyxy"]
+                feet_pos = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
+                self.last_position[slot] = feet_pos
+                self.last_seen_frame[slot] = frame_count
+
+        # 2. Identificar slots MISSING (jugadores que deberían estar pero no se detectan)
+        missing_slots = []
+        for slot, yolo_id in self.yolo_to_player.items():
+            if yolo_id not in current_yolo_ids:
+                # Este jugador no está en las detecciones actuales
+                frames_missing = frame_count - self.last_seen_frame[slot]
+                if frames_missing <= self.MAX_MISSING_FRAMES:
+                    missing_slots.append(slot)
+
+        # 3. Identificar IDs nuevos (no asignados a ningún slot)
+        assigned_yolo_ids = set(self.yolo_to_player.values())
+        new_yolo_ids = current_yolo_ids - assigned_yolo_ids
+
+        if frame_count % 300 == 0 and (new_yolo_ids or missing_slots):
+            print(f"[Tracker ReID DEBUG] Frame {frame_count}: missing_slots={missing_slots}, new_yolo_ids={new_yolo_ids}")
+            print(f"[Tracker ReID DEBUG] yolo_to_player={self.yolo_to_player}")
+
+        if not new_yolo_ids or not missing_slots:
+            return  # No hay nada que re-asignar
+
+        # 4. Intentar re-asignar IDs nuevos a slots missing por proximidad
+        reassignments = []
+        for new_id in list(new_yolo_ids):
+            det = next(d for d in detections_list if d["id"] == new_id)
+            xyxy = det["xyxy"]
+            new_feet_pos = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
+
+            # Buscar el slot missing más cercano a este nuevo ID
+            best_slot = None
+            best_distance = float('inf')
+
+            for slot in missing_slots:
+                if self.last_position[slot] is None:
+                    continue  # Sin posición conocida, no podemos calcular distancia
+
+                last_pos = self.last_position[slot]
+                distance = np.sqrt(
+                    (new_feet_pos[0] - last_pos[0])**2 +
+                    (new_feet_pos[1] - last_pos[1])**2
+                )
+
+                if distance < best_distance and distance < self.POSITION_THRESHOLD:
+                    best_distance = distance
+                    best_slot = slot
+
+            # Fallback: Si no encontró por proximidad, asignar por zona de cancha
+            if best_slot is None and missing_slots:
+                # Determinar zona del nuevo ID (near/far, left/right)
+                new_y = new_feet_pos[1]
+                new_x = new_feet_pos[0]
+                net_y = self.frame_height * self.NET_Y if self.frame_height else 9999
+                frame_center_x = (self.frame_height * 2) if self.frame_height else 1920  # approx width
+
+                is_near = new_y > net_y
+                is_left = new_x < frame_center_x
+
+                if frame_count % 300 == 0:
+                    print(f"[Tracker ReID DEBUG] Fallback para ID {new_id}: pos=({new_x:.0f}, {new_y:.0f}), near={is_near}, left={is_left}, missing={missing_slots}")
+
+                # Mapeo de zona a slot: J1=near-left, J2=near-right, J3=far-left, J4=far-right
+                # Intentar asignar a la zona exacta primero
+                if is_near and is_left and 1 in missing_slots:
+                    best_slot = 1
+                    best_distance = 999  # Marca como fallback
+                elif is_near and not is_left and 2 in missing_slots:
+                    best_slot = 2
+                    best_distance = 999
+                elif not is_near and is_left and 3 in missing_slots:
+                    best_slot = 3
+                    best_distance = 999
+                elif not is_near and not is_left and 4 in missing_slots:
+                    best_slot = 4
+                    best_distance = 999
+                else:
+                    # Fallback más flexible: si no puede asignar a la zona exacta,
+                    # asignar al primer slot disponible (mejor que nada)
+                    if missing_slots:
+                        best_slot = missing_slots[0]
+                        best_distance = 999
+                        if frame_count % 300 == 0:
+                            print(f"[Tracker ReID DEBUG] Asignación flexible: ID {new_id} → slot {best_slot} (no match perfecto)")
+
+            if best_slot is not None:
+                # Re-asignar este nuevo ID al slot faltante
+                old_yolo_id = self.yolo_to_player[best_slot]
+                self.yolo_to_player[best_slot] = new_id
+                reassignments.append((best_slot, old_yolo_id, new_id, best_distance))
+
+                # Actualizar posición y frame
+                self.last_position[best_slot] = new_feet_pos
+                self.last_seen_frame[best_slot] = frame_count
+
+                # Remover de las listas para no re-asignar múltiples veces
+                new_yolo_ids.remove(new_id)
+                missing_slots.remove(best_slot)
+
+        # Log de re-asignaciones
+        if reassignments:
+            print(f"[Tracker ReID] Frame {frame_count}: RE-ASIGNACIONES detectadas:")
+            for slot, old_id, new_id, dist in reassignments:
+                print(f"  J{slot}: YOLO_ID {old_id} → {new_id} (distancia={dist:.1f}px)")
+
+    # ------------------------------------------------------------------
+    # Utilidades privadas (deprecadas - mantener por compatibilidad)
     # ------------------------------------------------------------------
 
     def _get_zone(self, feet_y: float) -> str:
@@ -241,16 +474,49 @@ class Tracker:
                     continue
                 sid = active_slots[c]
                 d   = detections[r]
+                yid = d["id"]
+
+                # Confirmation buffer: si el slot que se propone es diferente al
+                # que este yolo_id tenía antes, exigir CONFIRM_FRAMES consecutivos
+                # antes de aplicar el cambio para evitar flicker por frames ruidosos.
+                current_sid = next(
+                    (s for s, data in self.slots.items()
+                     if data and data.get("yolo_id") == yid),
+                    None
+                )
+                if current_sid is not None and current_sid != sid:
+                    pend = self._pending.get(yid)
+                    if pend and pend[0] == sid:
+                        count = pend[1] + 1
+                    else:
+                        count = 1
+                    self._pending[yid] = (sid, count)
+                    if count < self.CONFIRM_FRAMES:
+                        # Aún no confirmado: mantener slot actual y actualizar posición
+                        self._maybe_flip_zone(current_sid, d["xyxy"][3])
+                        self.slots[current_sid]["last_pos"]   = d["pos"]
+                        self.slots[current_sid]["last_frame"] = frame_count
+                        self.slots[current_sid]["hist"] = self._blend_hist(
+                            self.slots[current_sid].get("hist"), d["hist"]
+                        )
+                        mapping[yid] = current_sid
+                        assigned_det_indices.add(r)
+                        continue
+                    # Confirmado: aplicar el nuevo slot
+                    del self._pending[yid]
+                else:
+                    self._pending.pop(yid, None)
+
                 # Actualizar zona adaptativa antes de guardar en el slot
                 self._maybe_flip_zone(sid, d["xyxy"][3])
                 self.slots[sid] = {
                     "last_pos":   d["pos"],
                     "last_frame": frame_count,
-                    "yolo_id":    d["id"],
-                    "hist":       self._blend_hist(self.slots[sid].get("hist"), d["hist"]),
+                    "yolo_id":    yid,
+                    "hist":       self._blend_hist(self.slots[sid].get("hist") if self.slots[sid] else None, d["hist"]),
                     "zone":       self.slot_zones[sid],
                 }
-                mapping[d["id"]] = sid
+                mapping[yid] = sid
                 assigned_det_indices.add(r)
 
         # --- Fase 2: Detecciones sin asignar → llenan slots vacíos por zona ---
@@ -295,6 +561,23 @@ class Tracker:
             if data and (frame_count - data["last_frame"]) > self.max_lost_frames:
                 self.slots[sid] = None
 
+        # Imponer orden lateral dentro de cada par de zona.
+        # Si J1 está a la derecha de J2 (o J3 a la derecha de J4), se han cruzado
+        # en el mapping: intercambiar slots y corregir el mapping resultante.
+        for s_left, s_right in [(1, 2), (3, 4)]:
+            if self.slots[s_left] is not None and self.slots[s_right] is not None:
+                x_left  = self.slots[s_left]["last_pos"][0]
+                x_right = self.slots[s_right]["last_pos"][0]
+                if x_left > x_right + 40:  # Cruce claro (>40 px)
+                    self.slots[s_left], self.slots[s_right] = (
+                        self.slots[s_right], self.slots[s_left]
+                    )
+                    for yolo_id_k, sid in list(mapping.items()):
+                        if sid == s_left:
+                            mapping[yolo_id_k] = s_right
+                        elif sid == s_right:
+                            mapping[yolo_id_k] = s_left
+
         return mapping
 
     # ------------------------------------------------------------------
@@ -310,36 +593,149 @@ class Tracker:
         run_ball      : ejecutar detección de pelota en este frame (frame skipping).
         run_far_zone  : ejecutar el segundo pase de zona lejana (más costoso).
         """
-        # Detección de personas — siempre, necesario para continuidad de IDs
-        person_results = self.model_persons.track(
-            frame, persist=True, classes=[0], conf=0.25, verbose=False
+        # Inicializar frame_height en el primer frame
+        if self.frame_height is None:
+            self.frame_height = frame.shape[0]
+
+        # ========== Supervision ByteTrack (exacto como padel_analytics) ==========
+        # Inicializar ByteTrack en el primer frame con el fps del video
+        if self.byte_tracker is None and frame_count == 0:
+            # Calcular FPS del video (30 por defecto si no se puede determinar)
+            video_fps = 30.0
+            self.byte_tracker = sv.ByteTrack(frame_rate=video_fps)
+            print(f"[Tracker] Supervision ByteTrack inicializado (fps={video_fps})")
+
+            # Inicializar Ball Tracker con interpolación
+            self.ball_tracker = BallTracker(fps=int(video_fps))
+            print(f"[Tracker] Ball Tracker con Kalman Filter inicializado (fps={video_fps})")
+
+        # 1. Detección YOLO (sin tracking)
+        person_results = self.model_persons.predict(
+            frame, classes=[0], conf=0.3, verbose=False  # Reducido de 0.5 a 0.3
         )[0]
 
-        mapping = {}
-        if person_results.boxes and person_results.boxes.id is not None:
-            detections = []
-            for i, yolo_id in enumerate(person_results.boxes.id.cpu().numpy()):
-                xyxy = person_results.boxes.xyxy[i].cpu().numpy()
-                if court_polygon is not None:
-                    feet = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
-                    if cv2.pointPolygonTest(court_polygon, feet, False) < 0:
-                        continue
-                pos = ((xyxy[0] + xyxy[2]) / 2, (xyxy[1] + xyxy[3]) / 2)
-                detections.append({"id": int(yolo_id), "pos": pos, "xyxy": xyxy})
+        # 2. Convertir a formato Supervision
+        detections = sv.Detections.from_ultralytics(person_results)
 
-            mapping = self._update_slots(detections, frame_count, frame)
+        # 3. Filtrar por polígono de cancha
+        if court_polygon is not None:
+            before_filter = len(detections)
+            mask = []
+            for i in range(len(detections)):
+                xyxy = detections.xyxy[i]
+                feet = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
+                mask.append(cv2.pointPolygonTest(court_polygon, feet, False) >= 0)
+            detections = detections[np.array(mask)]
+            after_filter = len(detections)
+
+            # Log cada 100 frames para debug
+            if frame_count % 100 == 0:
+                print(f"[Tracker DEBUG] Frame {frame_count}: Detectados={before_filter}, Después filtro polígono={after_filter}")
+
+        # 4. Actualizar ByteTrack con detecciones
+        detections = self.byte_tracker.update_with_detections(detections=detections)
+
+        if frame_count == 0:
+            print(f"[Tracker] Supervision ByteTrack activado")
+            print(f"[Tracker]   Detecciones tracked: {len(detections)}")
+
+        # ========== Procesar detections de Supervision ==========
+        mapping = {}
+        detections_list = []
+        if len(detections) > 0:
+            # Limitar a 4 jugadores máximo
+            if len(detections) > 4:
+                # Ordenar por confianza y tomar top 4
+                conf_indices = np.argsort(detections.confidence)[::-1][:4]
+                detections = detections[conf_indices]
+
+            for i in range(len(detections)):
+                xyxy = detections.xyxy[i]
+                track_id = detections.tracker_id[i] if detections.tracker_id is not None else None
+                conf = detections.confidence[i] if detections.confidence is not None else 0.0
+
+                if track_id is None:
+                    continue
+
+                pos = ((xyxy[0] + xyxy[2]) / 2, (xyxy[1] + xyxy[3]) / 2)
+                detections_list.append({
+                    "id": int(track_id),
+                    "pos": pos,
+                    "xyxy": xyxy,
+                    "conf": float(conf)
+                })
+
+            # ========== NUEVO SISTEMA: Inicialización + Mapeo permanente ==========
+            if not self.initialized:
+                # Fase de inicialización: acumular frames con 4 jugadores
+                if frame_count % 100 == 0 and frame_count < 200:
+                    print(f"[Tracker DEBUG] Frame {frame_count}: {len(detections_list)} jugadores detectados")
+
+                if len(detections_list) == 4:
+                    self.initialization_buffer.append((detections_list, frame))
+
+                    # Intentar inicializar después de INIT_FRAMES frames
+                    if len(self.initialization_buffer) >= self.INIT_FRAMES:
+                        # Usar el frame más reciente para inicialización
+                        recent_detections, recent_frame = self.initialization_buffer[-1]
+                        print(f"[Tracker] Intentando inicializar con {len(recent_detections)} jugadores...")
+                        if self._initialize_players(recent_detections, recent_frame):
+                            print(f"[Tracker] Inicialización completada en frame {frame_count}")
+                        else:
+                            print(f"[Tracker] Inicialización fallida - reiniciar buffer")
+                            self.initialization_buffer = []  # Reiniciar si falla
+
+                # Crear mapping aunque no estemos inicializados (todos con ID 0)
+                # Invertir yolo_to_player: {slot: yolo_id} → {yolo_id: slot}
+                inverted = {yolo_id: slot for slot, yolo_id in self.yolo_to_player.items()}
+
+                mapping = {}
+                for det in detections_list:
+                    yolo_id = det["id"]
+                    player_slot = inverted.get(yolo_id, 0)
+                    mapping[yolo_id] = player_slot
+            else:
+                # Ya inicializado: aplicar sistema de memoria temporal
+                # Re-asignar IDs nuevos a slots missing por proximidad
+                self._reassign_missing_players(detections_list, frame_count)
+
+                # Crear mapping con IDs actualizados
+                # Invertir yolo_to_player: {slot: yolo_id} → {yolo_id: slot}
+                inverted = {yolo_id: slot for slot, yolo_id in self.yolo_to_player.items()}
+
+                mapping = {}
+                for det in detections_list:
+                    yolo_id = det["id"]
+                    player_slot = inverted.get(yolo_id, 0)  # 0 si es nuevo ID (espectador)
+                    mapping[yolo_id] = player_slot
+
+                # Log cada 300 frames para ver si los IDs cambian
+                if frame_count % 300 == 0:
+                    current_yolo_ids = [det["id"] for det in detections_list]
+                    print(f"[Tracker ReID] Frame {frame_count}:")
+                    print(f"  IDs YOLO detectados: {current_yolo_ids}")
+                    print(f"  IDs en mapeo original: {list(self.yolo_to_player.keys())}")
+                    print(f"  Mapping actual: {mapping}")
+                    # Verificar cuántos IDs del mapeo original siguen activos
+                    original_ids_still_active = [yid for yid in self.yolo_to_player.keys() if yid in current_yolo_ids]
+                    print(f"  IDs originales aún activos: {original_ids_still_active} ({len(original_ids_still_active)}/{len(self.yolo_to_player)})")
 
         person_results.slot_mapping = mapping
 
+        # Guardar las detecciones filtradas para que processor.py las use
+        person_results.filtered_detections = detections
+
         # --- Detección de pelota con frame skipping ---
-        if run_ball:
-            ball_results = self.model_ball.track(
-                frame, persist=True, conf=0.10, verbose=False
+        if run_ball and self.model_ball is not None:
+            # Usar .predict() en lugar de .track() para evitar que ByteTrack
+            # bloquee nuevas detecciones después de perder el track inicial
+            ball_results = self.model_ball.predict(
+                frame, conf=0.05, verbose=False
             )[0]
         else:
             ball_results = None
 
-        if run_far_zone and run_ball:
+        if run_far_zone and run_ball and self.model_ball is not None:
             ball_far_detections = self._detect_ball_far_zone(frame)
         else:
             ball_far_detections = []
@@ -376,11 +772,13 @@ class Tracker:
         if crop.shape[0] < 40:
             return []
 
-        # Ampliar 2× → la pelota de 3-5px pasa a ser 6-10px (detectable)
-        upscaled = cv2.resize(crop, None, fx=2.0, fy=2.0,
+        # Ampliar 3× → la pelota de 3-5px pasa a ser 9-15px (muy detectable)
+        upscaled = cv2.resize(crop, None, fx=3.0, fy=3.0,
                               interpolation=cv2.INTER_LINEAR)
 
-        results = self.model_ball(upscaled, conf=0.08, verbose=False)[0]
+        if self.model_ball is None:
+            return []
+        results = self.model_ball(upscaled, conf=0.05, verbose=False)[0]
         if not results.boxes:
             return []
 
@@ -390,10 +788,10 @@ class Tracker:
             conf = float(box.conf[0].cpu().numpy())
             # Escalar de vuelta a coordenadas originales y sumar el offset del crop
             detections.append((
-                x1 / 2.0,
-                y1 / 2.0 + roi_top,
-                x2 / 2.0,
-                y2 / 2.0 + roi_top,
+                x1 / 3.0,
+                y1 / 3.0 + roi_top,
+                x2 / 3.0,
+                y2 / 3.0 + roi_top,
                 conf,
             ))
 
