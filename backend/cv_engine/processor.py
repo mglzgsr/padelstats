@@ -159,9 +159,14 @@ class VideoProcessor:
             ball_candidates = []
 
             if using_tracknet:
-                # TrackNetV3: posición pre-computada, sin filtrado adicional necesario
                 tn = self.tracknet_positions.get(frame_count)
                 if tn and tn[2]:  # visible=True
+                    tx, ty, _ = tn
+                    # Filtrar por polígono de la pista: descartar detecciones fuera
+                    in_court = cv2.pointPolygonTest(court_polygon, (float(tx), float(ty)), False) >= 0
+                    if not in_court:
+                        tn = None
+                if tn and tn[2]:
                     tx, ty, _ = tn
                     r = 8
                     trusted_ball_boxes = [SimpleBox([tx - r, ty - r, tx + r, ty + r])]
