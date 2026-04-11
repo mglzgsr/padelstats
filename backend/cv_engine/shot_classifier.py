@@ -1,110 +1,130 @@
 import numpy as np
+from .ball_tracker import BallTracker
 
 class ShotClassifier:
-    def __init__(self):
-        self.ball_buffer = []  # List of (center_x, center_y, frame_idx)
-        self.buffer_size = 15
-        self.impact_threshold_angle = 90  # Degrees
-        self.impact_threshold_speed_change = 1.5  # Ratio
+    """Detector de golpes basado en proximidad pelota-jugador."""
 
-    def detect_impact(self, frame_idx, ball_pos):
-        """
-        Detects a sudden change in ball trajectory or speed.
-        ball_pos: (x, y) or None
-        """
-        if ball_pos is None:
+    def __init__(self, fps=30.0):
+        self.fps = fps
+        self.shot_cooldown = max(15, int(fps * 0.5))  # Reducido de 0.8s a 0.5s
+        # Cooldown por jugador (no global)
+        self.last_shot_frame = {1: -999, 2: -999, 3: -999, 4: -999, 0: -999}
+        self.proximity_buffer = []
+        self.PROXIMITY_BUFFER_SIZE = 30
+
+        # Ball Tracker con Kalman Filter para interpolación
+        self.ball_tracker = BallTracker(fps=int(fps))
+        print(f"[ShotClassifier] Inicializado con interpolación Kalman (fps={fps})")
+
+    def detect_impact(self, frame_idx, ball_pos, players):
+        """Detecta golpe por approach→min→departure con interpolación Kalman."""
+        if not players:
             return None
 
-        self.ball_buffer.append((ball_pos[0], ball_pos[1], frame_idx))
-        if len(self.ball_buffer) > self.buffer_size:
-            self.ball_buffer.pop(0)
+        # Actualizar ball tracker con detección (o None para interpolar)
+        if ball_pos is not None:
+            bx, by = ball_pos
+            # Actualizar tracker con detección real (conf asumida 0.5)
+            ball_tracked = self.ball_tracker.update(frame_idx, (bx, by, 0.5))
+        else:
+            # Intentar interpolar
+            ball_tracked = self.ball_tracker.update(frame_idx, None)
 
-        if len(self.ball_buffer) < 5:
+        # Si no hay posición (ni real ni interpolada), salir
+        if ball_tracked is None:
             return None
 
-        # Calculate vectors
-        # Vector 1: before current point (last 2-3 points)
-        # Vector 2: after current point (not possible in real-time without delay, 
-        # but we can look at the sudden change to the current point)
-        
-        # Simpler: compare current velocity with previous average velocity
-        if len(self.ball_buffer) >= 3:
-            p1 = self.ball_buffer[-3]
-            p2 = self.ball_buffer[-2]
-            p3 = self.ball_buffer[-1]
-            
-            v1 = np.array([p2[0] - p1[0], p2[1] - p1[1]])
-            v2 = np.array([p3[0] - p2[0], p3[1] - p2[1]])
-            
-            # Check for sudden direction change
-            mag1 = np.linalg.norm(v1)
-            mag2 = np.linalg.norm(v2)
-            
-            if mag1 > 2 and mag2 > 2:
-                cos_theta = np.dot(v1, v2) / (mag1 * mag2)
-                cos_theta = np.clip(cos_theta, -1.0, 1.0)
-                angle = np.degrees(np.arccos(cos_theta))
-                
-                # If angle change is significant, it might be a hit or bounce
-                if angle > self.impact_threshold_angle:
-                    return {
-                        "frame": frame_idx,
-                        "pos": (p3[0], p3[1]),
-                        "type": "potential_impact",
-                        "angle": angle
-                    }
+        bx, by, conf = ball_tracked
+
+        # Jugador más cercano
+        closest_player, min_dist = None, float('inf')
+        for p in players:
+            px1, py1, px2, py2, pid = p
+            dist = np.sqrt((bx-(px1+px2)/2)**2 + (by-(py1+py2)/2)**2)
+            if dist < min_dist:
+                min_dist, closest_player = dist, p
+
+        if not closest_player:
+            return None
+
+        px1, py1, px2, py2, pid = closest_player
+        p_height = py2 - py1
+        # Threshold más generoso: mayor rango de distancia permitido
+        threshold = max(100, min(p_height * 1.0, 200))
+
+        # Guardar posición trackeada (no raw) para poder calcular velocidad
+        self.proximity_buffer.append((min_dist, pid, (bx, by), frame_idx))
+        if len(self.proximity_buffer) > self.PROXIMITY_BUFFER_SIZE:
+            self.proximity_buffer.pop(0)
+
+        # Reducido a 5 para detectar golpes más rápidamente
+        if len(self.proximity_buffer) < 5:
+            return None
+
+        recent = self.proximity_buffer[-12:]  # Reducido a 12 para ventana más pequeña
+        min_idx = min(range(len(recent)), key=lambda i: recent[i][0])
+
+        # Más permisivo: permite min_idx más cerca de los bordes
+        if min_idx < 3 or min_idx > len(recent)-3 or recent[min_idx][0] > threshold:
+            return None
+
+        approach = [d for d,_,_,_ in recent[:min_idx][-4:]]
+        departure = [d for d,_,_,_ in recent[min_idx+1:][:4]]
+
+        # Reducido a 2 para ser más permisivo
+        if len(approach) < 2 or len(departure) < 2:
+            return None
+
+        # Checks más permisivos: 0.90 en vez de 0.85, y 1.10 en vez de 1.15
+        is_app = np.mean(approach[len(approach)//2:]) < np.mean(approach[:len(approach)//2]) * 0.90
+        is_dep = np.mean(departure[len(departure)//2:]) > np.mean(departure[:len(departure)//2]) * 1.10
+
+        # Verificar que la pelota cambió de dirección (golpe real vs flyby).
+        # Un "flyby" (pelota que pasa cerca sin ser golpeada) mantiene la misma
+        # dirección antes y después del punto más cercano.
+        # Un golpe real produce un cambio de dirección significativo.
+        if is_app and is_dep:
+            before_pos = [(pos, fi) for _, _, pos, fi in recent[:min_idx]]
+            after_pos  = [(pos, fi) for _, _, pos, fi in recent[min_idx+1:]]
+            if len(before_pos) >= 2 and len(after_pos) >= 2:
+                # Vector de velocidad antes del impacto
+                p1, p2 = before_pos[-2][0], before_pos[-1][0]
+                v_before = np.array([p2[0]-p1[0], p2[1]-p1[1]], float)
+                # Vector de velocidad después del impacto
+                p3, p4 = after_pos[0][0], after_pos[1][0]
+                v_after  = np.array([p4[0]-p3[0], p4[1]-p3[1]], float)
+                mag_b = np.linalg.norm(v_before)
+                mag_a = np.linalg.norm(v_after)
+                if mag_b > 0 and mag_a > 0:
+                    dot = np.dot(v_before/mag_b, v_after/mag_a)
+                    # dot ≈ 1 → misma dirección (flyby) → descartar
+                    # dot ≈ 0 o negativo → dirección cambió (golpe real) → aceptar
+                    if dot > 0.6:
+                        return None  # Pelota volando de largo, no golpeada
+
+        if is_app and is_dep:
+            _, min_pid, min_pos, min_frame = recent[min_idx]
+            # Si player_id es 0 (no asignado), buscar el jugador con slot válido más cercano
+            if min_pid == 0 and players:
+                valid_players = [(px1,py1,px2,py2,pid) for px1,py1,px2,py2,pid in players if pid > 0]
+                if valid_players:
+                    # Asignar al jugador válido más cercano
+                    bx, by = min_pos
+                    min_pid = min(valid_players, key=lambda p: np.sqrt((bx-(p[0]+p[2])/2)**2 + (by-(p[1]+p[3])/2)**2))[4]
+                else:
+                    min_pid = 1  # Fallback a J1
+
+            # Verificar cooldown POR JUGADOR
+            last_frame_this_player = self.last_shot_frame.get(min_pid, -999)
+            if min_frame - last_frame_this_player < self.shot_cooldown:
+                return None  # Este jugador golpeó hace poco, ignorar
+
+            print(f"[Shot] Frame {frame_idx}: GOLPE J{min_pid} (dist={recent[min_idx][0]:.1f}px)")
+            shot_type = "Smash/Bandeja" if min_pos[1] < py1 + p_height*0.3 else "Stroke"
+            self.last_shot_frame[min_pid] = min_frame
+            return {"frame": min_frame, "pos": min_pos, "player_id": min_pid, "shot_type": shot_type, "type": "proximity"}
         return None
 
     def classify_shot(self, impact, players):
-        """
-        Classifies the impact event based on proximity to players.
-        impact: dict from detect_impact
-        players: list of player boxes [(x1,y1,x2,y2,id), ...]
-        """
-        if not impact or not players:
-            return None
-
-        ix, iy = impact["pos"]
-        
-        # Find closest player
-        closest_player = None
-        min_dist = float('inf')
-        
-        for p in players:
-            px1, py1, px2, py2, pid = p
-            # Center of player
-            pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
-            dist = np.sqrt((ix - pcx)**2 + (iy - pcy)**2)
-            
-            if dist < min_dist:
-                min_dist = dist
-                closest_player = p
-
-        # If impact is near a player, it's a shot. Otherwise it's a bounce on court/wall.
-        # Strict threshold (80px) to ensure it's a racket hit, not a floor bounce near feet
-        if closest_player and min_dist < 80:
-            px1, py1, px2, py2, pid = closest_player
-            p_height = py2 - py1
-            
-            # Simple classification logic
-            shot_type = "Stroke" # Default
-            
-            # 1. Height check (Smash/Bandeja)
-            # If hit is in top 20% of player height or above head
-            if iy < py1 + p_height * 0.2:
-                shot_type = "Smash/Bandeja"
-
-            return {
-                "frame": impact["frame"],
-                "player_id": pid,
-                "shot_type": shot_type,
-                "pos": (ix, iy),
-                "event": "Shot"
-            }
-        
-        # If not near a player, classify as Bounce
-        return {
-            "frame": impact["frame"],
-            "pos": (ix, iy),
-            "event": "Bounce"
-        }
+        return {"frame": impact["frame"], "player_id": impact["player_id"], "shot_type": impact["shot_type"], "pos":
+impact["pos"], "event": "Shot"} if impact else None
