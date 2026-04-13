@@ -85,6 +85,9 @@ class Tracker:
         self.max_lost_frames = 90     # frames antes de expirar un slot (~3s a 30fps)
         self.CONFIRM_FRAMES = 3       # frames consecutivos para confirmar reasignación
         self._pending = {}            # {yolo_id: (slot, count)}
+        self.hist_alpha = 0.2         # peso del histograma nuevo en el blend EWA
+        self.ZONE_FLIP_FRAMES = 15    # frames consecutivos para confirmar cambio de zona
+        self._zone_wrong_frames = {1: 0, 2: 0, 3: 0, 4: 0}
 
         # ========== Ball Tracker con Kalman Filter e interpolación ==========
         self.ball_tracker = None  # Se inicializará con fps del video

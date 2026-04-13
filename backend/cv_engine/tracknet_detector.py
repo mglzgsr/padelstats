@@ -90,9 +90,12 @@ class TrackNetDetector:
             with open(predict_py) as f:
                 src = f.read()
 
-            # Forzar CPU: MPS puede disparar jetsam (presión de memoria) en macOS
-            # antes de que el modelo siquiera cargue, causando SIGTERM (-15).
-            _device = 'cpu'
+            # Usar MPS si está disponible (Apple Silicon GPU), si no CPU
+            import torch as _torch
+            if _torch.backends.mps.is_available():
+                _device = 'mps'
+            else:
+                _device = 'cpu'
 
             patched = src
             # map_location en torch.load
@@ -123,8 +126,7 @@ class TrackNetDetector:
                 f.write(patched)
             print(f'[TrackNet] predict.py parcheado → device={_device}')
 
-            # 3. Lanzar predict.py parcheado desde /tmp, con cwd=tracknet_dir
-            #    para que los imports relativos de TrackNetV3 funcionen
+            # 3. Lanzar predict.py parcheado con streaming de output en tiempo real
             print('[TrackNet] Corriendo inferencia...')
             cmd = [
                 sys.executable, patched_predict,
@@ -136,19 +138,33 @@ class TrackNetDetector:
             if self.inpaintnet and os.path.isfile(self.inpaintnet):
                 cmd += ['--inpaintnet_file', self.inpaintnet]
 
-            ret = subprocess.run(
+            import threading as _threading
+            proc = subprocess.Popen(
                 cmd,
                 cwd=self.tracknet_dir,
-                capture_output=True,       # capturar para debug
-                start_new_session=True,    # aísla del grupo de procesos de uvicorn
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+                text=True,
             )
-            # Mostrar siempre stdout/stderr en el log para poder debugar
-            if ret.stdout:
-                print('[TrackNet stdout]', ret.stdout.decode(errors='replace'))
-            if ret.stderr:
-                print('[TrackNet stderr]', ret.stderr.decode(errors='replace'))
-            if ret.returncode != 0:
-                print(f'[TrackNet] predict.py falló (returncode={ret.returncode}) — usando YOLO')
+
+            # Mostrar stdout y stderr en tiempo real para ver el progreso
+            def _stream(pipe):
+                for line in pipe:
+                    line = line.rstrip()
+                    if line:
+                        print(f'[TrackNet] {line}', flush=True)
+
+            t_out = _threading.Thread(target=_stream, args=(proc.stdout,), daemon=True)
+            t_err = _threading.Thread(target=_stream, args=(proc.stderr,), daemon=True)
+            t_out.start()
+            t_err.start()
+            proc.wait()
+            t_out.join()
+            t_err.join()
+
+            if proc.returncode != 0:
+                print(f'[TrackNet] predict.py falló (returncode={proc.returncode}) — usando YOLO')
                 return {}
 
             if on_progress:
