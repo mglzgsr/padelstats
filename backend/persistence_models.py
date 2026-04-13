@@ -10,6 +10,7 @@ class VideoRecord(Base):
     id = Column(String, primary_key=True, index=True, default=lambda: str(uuid.uuid4()))
     filename = Column(String)
     status = Column(String, default="pending")  # pending, processing, completed, error
+    stage = Column(String, default="")          # fase actual: tracknet, analyzing, etc.
     total_frames = Column(Integer, default=0)   # total frames del vídeo (se fija al inicio)
     processed_frames = Column(Integer, default=0)  # frames ya procesados (progreso)
     created_at = Column(DateTime, default=datetime.utcnow)

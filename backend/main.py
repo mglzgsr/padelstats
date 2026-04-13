@@ -36,29 +36,41 @@ def read_root():
 
 @app.post("/upload")
 async def upload_video(file: UploadFile = File(...)):
+    print(f"[UPLOAD] Iniciando upload: {file.filename}, tipo: {file.content_type}")
+
     if not file.content_type.startswith("video/"):
         raise HTTPException(status_code=400, detail="File must be a video")
 
     file_id = str(uuid.uuid4())
     file_extension = os.path.splitext(file.filename or ".mp4")[1]
     filename = f"{file_id}{file_extension}"
+    print(f"[UPLOAD] file_id={file_id}, filename={filename}")
 
     try:
         # Guardar temporalmente y luego mover al backend de storage
+        print(f"[UPLOAD] Guardando archivo temporal...")
         with tempfile.NamedTemporaryFile(delete=False, suffix=file_extension) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
+        print(f"[UPLOAD] Archivo temporal guardado en: {tmp_path}")
 
+        print(f"[UPLOAD] Moviendo a storage...")
         stored_path = storage.save(tmp_path, filename)
+        print(f"[UPLOAD] Archivo guardado en: {stored_path}")
         os.unlink(tmp_path)
 
+        print(f"[UPLOAD] Guardando en base de datos...")
         db = next(get_db())
         db_video = VideoRecord(id=file_id, filename=file.filename, status="uploaded")
         db.add(db_video)
         db.commit()
         db.close()
+        print(f"[UPLOAD] ✅ Upload completado: {file_id}")
 
     except Exception as e:
+        print(f"[UPLOAD] ❌ ERROR: {type(e).__name__}: {str(e)}")
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Could not save file: {str(e)}")
 
     return {
@@ -88,7 +100,14 @@ async def start_analysis(video_id: str, background_tasks: BackgroundTasks, db: S
     video.status = "processing"
     db.commit()
 
-    file_path = os.path.join(UPLOAD_DIR, f"{video.id}{os.path.splitext(video.filename)[1]}")
+    # Construir path al vídeo según el backend de storage
+    file_extension = os.path.splitext(video.filename)[1]
+    if BACKEND == "local":
+        file_path = os.path.join(str(LOCAL_DIR), f"{video.id}{file_extension}")
+    else:
+        # Para S3: la key es uploads/{filename}
+        file_path = f"uploads/{video.id}{file_extension}"
+
     service = AnalysisService(db)
     background_tasks.add_task(service.analyze_video, video.id, file_path)
 
@@ -119,6 +138,7 @@ def get_results(video_id: str, db: Session = Depends(get_db)):
         "video_id": video_id,
         "filename": video.filename,
         "status": video.status,
+        "stage": video.stage or "",
         "total_frames": video.total_frames or 0,
         "processed_frames": video.processed_frames or 0,
         "shots_count": len(shots),
@@ -130,4 +150,23 @@ def get_results(video_id: str, db: Session = Depends(get_db)):
 def list_videos(db: Session = Depends(get_db)):
     videos = db.query(VideoRecord).all()
     return videos
+
+@app.post("/cancel/{video_id}")
+def cancel_analysis(video_id: str, db: Session = Depends(get_db)):
+    """
+    Cancela un análisis en proceso marcándolo como 'error'.
+    Nota: el proceso de análisis seguirá corriendo en background,
+    pero el usuario puede reiniciarlo después.
+    """
+    video = db.query(VideoRecord).filter(VideoRecord.id == video_id).first()
+    if not video:
+        raise HTTPException(status_code=404, detail="Video not found")
+
+    if video.status != "processing":
+        raise HTTPException(status_code=400, detail="Video is not being processed")
+
+    video.status = "error"
+    db.commit()
+
+    return {"message": "Analysis cancelled", "video_id": video_id}
 

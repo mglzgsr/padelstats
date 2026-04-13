@@ -33,6 +33,7 @@ interface BackendResult {
   video_id: string;
   filename?: string;
   status: string;
+  stage?: string;
   total_frames: number;
   processed_frames: number;
   shots_count: number;
@@ -193,6 +194,13 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
       const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/results/${id}`);
       if (!res.ok) throw new Error(`Error ${res.status}`);
       const json: BackendResult = await res.json();
+
+      // Log de progreso durante procesado
+      if (json.status === "processing" && json.total_frames > 0) {
+        const pct = Math.round((json.processed_frames / json.total_frames) * 100);
+        console.log(`[Progress] ${pct}% (${json.processed_frames}/${json.total_frames} frames)`);
+      }
+
       setData(json);
       setError(null);
     } catch (err) {
@@ -204,11 +212,15 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
 
   useEffect(() => {
     fetchResults();
+    // Polling más frecuente durante procesado (2s), más lento cuando está idle (5s)
+    const isProcessing = data?.status === "processing";
+    const pollInterval = isProcessing ? 2000 : 5000;
+
     const interval = setInterval(() => {
       // Dejar de hacer polling cuando el análisis esté completo o haya fallado
       if (data?.status === "completed" || data?.status === "error") return;
       fetchResults();
-    }, 5000);
+    }, pollInterval);
     return () => clearInterval(interval);
   }, [fetchResults, data?.status]);
 
@@ -226,6 +238,16 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
   const retryAnalysis = async () => {
     await fetch(`${process.env.NEXT_PUBLIC_API_URL}/analyze/${id}`, { method: "POST" });
     fetchResults();
+  };
+
+  const cancelAnalysis = async () => {
+    if (!confirm("¿Cancelar el análisis de este vídeo?")) return;
+    try {
+      await fetch(`${process.env.NEXT_PUBLIC_API_URL}/cancel/${id}`, { method: "POST" });
+      fetchResults();
+    } catch (err) {
+      console.error("Error al cancelar:", err);
+    }
   };
 
   if (error || !data) {
@@ -251,6 +273,47 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
 
   return (
     <div className="min-h-screen bg-slate-950 text-white p-6 md:p-10 flex flex-col gap-8 max-w-7xl mx-auto">
+
+      {/* ── Banner de procesado (solo visible durante processing) ── */}
+      {isProcessing && (
+        <div className="bg-gradient-to-r from-sky-900/40 to-blue-900/40 border border-sky-700/50 rounded-2xl p-4 flex items-center gap-4">
+          <div className="w-10 h-10 border-4 border-sky-400 border-t-transparent rounded-full animate-spin flex-shrink-0" />
+          <div className="flex-1">
+            {data.total_frames > 0 && data.processed_frames > 0 ? (
+              <>
+                <div className="font-bold text-sky-200 mb-1">
+                  {data.stage || 'Analizando frames…'} {Math.round((data.processed_frames / data.total_frames) * 100)}%
+                </div>
+                <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                  <div
+                    className="h-full bg-gradient-to-r from-sky-500 to-blue-400 rounded-full transition-all duration-1000"
+                    style={{ width: `${(data.processed_frames / data.total_frames) * 100}%` }}
+                  />
+                </div>
+                <div className="text-xs text-slate-400 mt-1">
+                  {data.processed_frames.toLocaleString()} / {data.total_frames.toLocaleString()} frames
+                </div>
+              </>
+            ) : (
+              <>
+                <div className="font-bold text-sky-200 mb-1">
+                  {data.stage || 'Inicializando análisis…'}
+                </div>
+                <div className="h-2 bg-slate-800 rounded-full overflow-hidden">
+                  <div className="h-full bg-gradient-to-r from-sky-500 to-blue-400 rounded-full animate-pulse" style={{ width: '100%' }} />
+                </div>
+                <div className="text-xs text-slate-400 mt-1">Preparando procesado de vídeo</div>
+              </>
+            )}
+          </div>
+          <button
+            onClick={cancelAnalysis}
+            className="px-4 py-2 bg-red-500/20 hover:bg-red-500/30 border border-red-500/50 rounded-lg text-red-300 text-sm font-semibold transition-colors"
+          >
+            Cancelar
+          </button>
+        </div>
+      )}
 
       {/* ── Header ── */}
       <header className="flex flex-wrap items-start justify-between gap-4">
@@ -287,21 +350,32 @@ export default function DashboardPage({ params }: { params: Promise<{ id: string
             <div className="text-xs text-slate-500 uppercase font-semibold mb-0.5">
               {isProcessing ? "Progreso" : "Frames"}
             </div>
-            {isProcessing && data.total_frames > 0 ? (
-              <>
-                <div className="text-sm font-black text-white">
-                  {Math.round((data.processed_frames / data.total_frames) * 100)}%
-                </div>
-                <div className="mt-1 h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-sky-500 rounded-full transition-all duration-1000"
-                    style={{ width: `${(data.processed_frames / data.total_frames) * 100}%` }}
-                  />
-                </div>
-                <div className="text-xs text-slate-600 mt-0.5">
-                  {data.processed_frames.toLocaleString()} / {data.total_frames.toLocaleString()}
-                </div>
-              </>
+            {isProcessing ? (
+              data.processed_frames > 0 && data.total_frames > 0 ? (
+                <>
+                  <div className="text-sm font-black text-white">
+                    {Math.round((data.processed_frames / data.total_frames) * 100)}%
+                  </div>
+                  <div className="mt-1 h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-sky-500 rounded-full transition-all duration-1000"
+                      style={{ width: `${(data.processed_frames / data.total_frames) * 100}%` }}
+                    />
+                  </div>
+                  <div className="text-xs text-slate-600 mt-0.5">
+                    {data.processed_frames.toLocaleString()} / {data.total_frames.toLocaleString()}
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="text-xs font-bold text-sky-300 leading-tight">
+                    {data.stage ? '🎾 TrackNet' : '…'}
+                  </div>
+                  <div className="mt-1 h-1.5 w-full bg-slate-700 rounded-full overflow-hidden">
+                    <div className="h-full bg-sky-500 rounded-full animate-pulse" style={{ width: '100%' }} />
+                  </div>
+                </>
+              )
             ) : (
               <div className="text-2xl font-black text-white">{data.total_frames.toLocaleString()}</div>
             )}

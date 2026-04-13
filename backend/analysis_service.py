@@ -49,7 +49,7 @@ class AnalysisService:
                     db_shot = ShotEvent(
                         video_id=video_id,
                         frame=shot_data["frame"],
-                        timestamp=shot_data["frame"] / 30.0,
+                        timestamp=shot_data["frame"] / video_fps,
                         player_id=shot_data["player_id"],
                         shot_type=shot_data["shot_type"],
                         pos_x=shot_data["pos"][0],
@@ -79,17 +79,31 @@ class AnalysisService:
                 court_config_path=court_config if os.path.exists(court_config) else None
             )
             
-            # 4. Fijar total_frames al inicio para mostrar progreso correcto
+            # 4. Fijar total_frames y fps al inicio para progreso y timestamps correctos
             import cv2 as _cv2
             _cap = _cv2.VideoCapture(abs_file_path)
             video.total_frames = int(_cap.get(_cv2.CAP_PROP_FRAME_COUNT))
+            video_fps = _cap.get(_cv2.CAP_PROP_FPS) or 30.0
             _cap.release()
             db.commit()
+            print(f"Vídeo: {video.total_frames} frames @ {video_fps:.1f}fps")
 
             # 5. Run Analysis con callbacks de evento y progreso
-            def save_progress(current: int, total: int):
+            STAGE_LABELS = {
+                'tracknet_start':  'Detectando pelota (iniciando)…',
+                'tracknet_scaled': 'Detectando pelota (escalando vídeo)…',
+                'tracknet_done':   'Detectando pelota (procesando)…',
+                'tracknet_loaded': 'Detectando pelota (cargando resultados)…',
+            }
+
+            def save_progress(current, total):
                 try:
-                    video.processed_frames = current
+                    if isinstance(current, str):
+                        # Llamada de fase TrackNet: actualizar stage, no processed_frames
+                        video.stage = STAGE_LABELS.get(current, current)
+                    else:
+                        video.processed_frames = current
+                        video.stage = 'Analizando frames…'
                     db.commit()
                 except Exception:
                     db.rollback()
