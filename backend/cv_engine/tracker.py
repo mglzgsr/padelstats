@@ -70,23 +70,31 @@ class Tracker:
         self.byte_tracker = None  # Se inicializará en el primer frame
         print(f"[Tracker] Supervision ByteTrack - usando defaults como padel_analytics")
 
-        # ========== NUEVO SISTEMA: Mapeo permanente YOLO ID → Player Slot ==========
-        # En lugar de reasignar slots por posición, mantenemos asignación inicial
-        self.yolo_to_player = {}  # {yolo_id: player_slot} ej: {5: 1, 12: 2, 23: 3, 45: 4}
-        self.initialized = False  # Flag: ¿ya asignamos J1-J4?
+        # ========== SISTEMA DE SLOTS (asignación estable J1-J4) ==========
+        self.initialized = False
+        self.initialization_buffer = []
+        self.INIT_FRAMES = 30
+
+        # yolo_to_player se mantiene solo para la inicialización inicial
+        self.yolo_to_player = {}  # {yolo_id: slot}
+
+        # Estado para _update_slots (Hungarian + color histograms)
+        self.slots = {1: None, 2: None, 3: None, 4: None}
+        self.slot_zones = {1: 'near', 2: 'near', 3: 'far', 4: 'far'}
+        self.max_distance = 400       # px – umbral espacial para matching
+        self.max_lost_frames = 90     # frames antes de expirar un slot (~3s a 30fps)
+        self.CONFIRM_FRAMES = 3       # frames consecutivos para confirmar reasignación
+        self._pending = {}            # {yolo_id: (slot, count)}
 
         # ========== Ball Tracker con Kalman Filter e interpolación ==========
         self.ball_tracker = None  # Se inicializará con fps del video
         print(f"[Tracker] Ball Tracker con interpolación: Pendiente (se inicializa con fps)")
-        self.initialization_buffer = []  # Buffer de detecciones para inicialización robusta
-        self.INIT_FRAMES = 30  # Frames para analizar antes de asignar J1-J4
 
-        # ========== SISTEMA DE MEMORIA TEMPORAL (Re-asignación inteligente) ==========
-        # Recordar última posición conocida y último frame visto de cada slot
-        self.last_position = {1: None, 2: None, 3: None, 4: None}  # {slot: (x, y)}
-        self.last_seen_frame = {1: -999, 2: -999, 3: -999, 4: -999}  # {slot: frame_count}
-        self.POSITION_THRESHOLD = 400  # pixels - más permisivo (era 250)
-        self.MAX_MISSING_FRAMES = 300  # ~10 seg a 30fps (era 90)
+        # Mantener compatibilidad con código antiguo que usa POSITION_THRESHOLD
+        self.last_position = {1: None, 2: None, 3: None, 4: None}
+        self.last_seen_frame = {1: -999, 2: -999, 3: -999, 4: -999}
+        self.POSITION_THRESHOLD = 400
+        self.MAX_MISSING_FRAMES = 300
 
         self.frame_height = None  # Se asigna al primer frame
 
@@ -165,6 +173,19 @@ class Tracker:
             print(f"  J3 (far-izq):  YOLO ID {far_players[0]['yolo_id']} @ Y={far_players[0]['y']:.0f}, X={far_players[0]['x']:.0f}")
             print(f"  J4 (far-der):  YOLO ID {far_players[1]['yolo_id']} @ Y={far_players[1]['y']:.0f}, X={far_players[1]['x']:.0f}")
             print(f"[Tracker INIT] Diccionario yolo_to_player: {self.yolo_to_player}")
+
+            # Inicializar self.slots para que _update_slots pueda funcionar desde ya
+            det_by_id = {d["id"]: d for d in detections}
+            for yolo_id, slot in self.yolo_to_player.items():
+                det = det_by_id.get(yolo_id)
+                if det:
+                    self.slots[slot] = {
+                        "last_pos":   det["pos"],
+                        "last_frame": 0,
+                        "yolo_id":    yolo_id,
+                        "hist":       None,
+                        "zone":       self.slot_zones[slot],
+                    }
 
             self.initialized = True
             print(f"[Tracker INIT] ===== INICIALIZACIÓN COMPLETADA =====")
@@ -688,40 +709,17 @@ class Tracker:
                             print(f"[Tracker] Inicialización fallida - reiniciar buffer")
                             self.initialization_buffer = []  # Reiniciar si falla
 
-                # Crear mapping aunque no estemos inicializados (todos con ID 0)
-                # Invertir yolo_to_player: {slot: yolo_id} → {yolo_id: slot}
-                inverted = {yolo_id: slot for slot, yolo_id in self.yolo_to_player.items()}
-
-                mapping = {}
-                for det in detections_list:
-                    yolo_id = det["id"]
-                    player_slot = inverted.get(yolo_id, 0)
-                    mapping[yolo_id] = player_slot
+                # Pre-inicialización: todos los slots a 0 hasta tener 4 jugadores
+                mapping = {det["id"]: 0 for det in detections_list}
             else:
-                # Ya inicializado: aplicar sistema de memoria temporal
-                # Re-asignar IDs nuevos a slots missing por proximidad
-                self._reassign_missing_players(detections_list, frame_count)
+                # Ya inicializado: usar _update_slots
+                # Hungarian algorithm + color histograms → asignación estable sin depender de ByteTrack IDs
+                mapping = self._update_slots(detections_list, frame_count, frame)
 
-                # Crear mapping con IDs actualizados
-                # Invertir yolo_to_player: {slot: yolo_id} → {yolo_id: slot}
-                inverted = {yolo_id: slot for slot, yolo_id in self.yolo_to_player.items()}
-
-                mapping = {}
-                for det in detections_list:
-                    yolo_id = det["id"]
-                    player_slot = inverted.get(yolo_id, 0)  # 0 si es nuevo ID (espectador)
-                    mapping[yolo_id] = player_slot
-
-                # Log cada 300 frames para ver si los IDs cambian
+                # Log cada 300 frames
                 if frame_count % 300 == 0:
-                    current_yolo_ids = [det["id"] for det in detections_list]
-                    print(f"[Tracker ReID] Frame {frame_count}:")
-                    print(f"  IDs YOLO detectados: {current_yolo_ids}")
-                    print(f"  IDs en mapeo original: {list(self.yolo_to_player.keys())}")
-                    print(f"  Mapping actual: {mapping}")
-                    # Verificar cuántos IDs del mapeo original siguen activos
-                    original_ids_still_active = [yid for yid in self.yolo_to_player.keys() if yid in current_yolo_ids]
-                    print(f"  IDs originales aún activos: {original_ids_still_active} ({len(original_ids_still_active)}/{len(self.yolo_to_player)})")
+                    active = {sid: (data["yolo_id"], data["last_pos"]) for sid, data in self.slots.items() if data}
+                    print(f"[Tracker] Frame {frame_count} — slots activos: { {f'J{s}': f'id={v[0]} pos=({v[1][0]:.0f},{v[1][1]:.0f})' for s,v in active.items()} }")
 
         person_results.slot_mapping = mapping
 
