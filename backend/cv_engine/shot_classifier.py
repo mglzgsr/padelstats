@@ -49,8 +49,11 @@ class ShotClassifier:
 
         px1, py1, px2, py2, pid = closest_player
         p_height = py2 - py1
-        # Threshold más generoso: mayor rango de distancia permitido
-        threshold = max(100, min(p_height * 1.0, 200))
+        p_width  = px2 - px1
+        # Con TrackNet tenemos la pelota en ~99% de frames, así que podemos
+        # usar un threshold mucho más ajustado que con YOLO.
+        # La pelota tiene que estar realmente cerca del jugador para contar como golpe.
+        threshold = max(60, min(p_height * 0.40, 150))
 
         # Guardar posición trackeada (no raw) para poder calcular velocidad
         self.proximity_buffer.append((min_dist, pid, (bx, by), frame_idx))
@@ -78,29 +81,6 @@ class ShotClassifier:
         # Checks más permisivos: 0.90 en vez de 0.85, y 1.10 en vez de 1.15
         is_app = np.mean(approach[len(approach)//2:]) < np.mean(approach[:len(approach)//2]) * 0.90
         is_dep = np.mean(departure[len(departure)//2:]) > np.mean(departure[:len(departure)//2]) * 1.10
-
-        # Verificar que la pelota cambió de dirección (golpe real vs flyby).
-        # Un "flyby" (pelota que pasa cerca sin ser golpeada) mantiene la misma
-        # dirección antes y después del punto más cercano.
-        # Un golpe real produce un cambio de dirección significativo.
-        if is_app and is_dep:
-            before_pos = [(pos, fi) for _, _, pos, fi in recent[:min_idx]]
-            after_pos  = [(pos, fi) for _, _, pos, fi in recent[min_idx+1:]]
-            if len(before_pos) >= 2 and len(after_pos) >= 2:
-                # Vector de velocidad antes del impacto
-                p1, p2 = before_pos[-2][0], before_pos[-1][0]
-                v_before = np.array([p2[0]-p1[0], p2[1]-p1[1]], float)
-                # Vector de velocidad después del impacto
-                p3, p4 = after_pos[0][0], after_pos[1][0]
-                v_after  = np.array([p4[0]-p3[0], p4[1]-p3[1]], float)
-                mag_b = np.linalg.norm(v_before)
-                mag_a = np.linalg.norm(v_after)
-                if mag_b > 0 and mag_a > 0:
-                    dot = np.dot(v_before/mag_b, v_after/mag_a)
-                    # dot ≈ 1 → misma dirección (flyby) → descartar
-                    # dot ≈ 0 o negativo → dirección cambió (golpe real) → aceptar
-                    if dot > 0.6:
-                        return None  # Pelota volando de largo, no golpeada
 
         if is_app and is_dep:
             _, min_pid, min_pos, min_frame = recent[min_idx]
