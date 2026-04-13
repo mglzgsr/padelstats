@@ -162,13 +162,17 @@ class VideoProcessor:
                 tn = self.tracknet_positions.get(frame_count)
                 if tn and tn[2]:  # visible=True
                     tx, ty, _ = tn
-                    # Filtrar solo por coordenadas X del polígono (banda horizontal).
-                    # NO filtrar por Y: la pelota puede estar en el aire (lobs, smashes)
-                    # por encima del polígono de suelo. Sí descartamos X fuera del ancho
-                    # de la pista para evitar detecciones en la pista adyacente.
+                    # Filtrar por X del polígono (evita pista adyacente) y por Y con
+                    # margen amplio hacia arriba (permite lobs/smashes en el aire pero
+                    # descarta detecciones en el techo/fondo de la imagen).
                     poly_xs = court_polygon[:, 0]
+                    poly_ys = court_polygon[:, 1]
                     x_min, x_max = float(poly_xs.min()), float(poly_xs.max())
-                    if not (x_min <= tx <= x_max):
+                    # Límite Y superior: parte más alta del polígono menos 60% de margen
+                    # (un lob puede subir bastante por encima del fondo de la pista)
+                    y_top_court = float(poly_ys.min())
+                    y_min_ball = y_top_court * 0.4   # permite zona alta del aire
+                    if not (x_min <= tx <= x_max and ty >= y_min_ball):
                         tn = None
                 if tn and tn[2]:
                     tx, ty, _ = tn

@@ -177,18 +177,22 @@ class Tracker:
             print(f"  J4 (far-der):  YOLO ID {far_players[1]['yolo_id']} @ Y={far_players[1]['y']:.0f}, X={far_players[1]['x']:.0f}")
             print(f"[Tracker INIT] Diccionario yolo_to_player: {self.yolo_to_player}")
 
-            # Inicializar self.slots para que _update_slots pueda funcionar desde ya
+            # Inicializar self.slots con histogramas reales desde el primer frame
+            # Esto es crítico: sin histogramas iniciales, _update_slots solo usa
+            # distancia espacial y falla cuando los jugadores se cruzan.
             det_by_id = {d["id"]: d for d in detections}
             for yolo_id, slot in self.yolo_to_player.items():
                 det = det_by_id.get(yolo_id)
                 if det:
+                    initial_hist = self._get_color_histogram(frame, det["xyxy"]) if frame is not None else None
                     self.slots[slot] = {
                         "last_pos":   det["pos"],
                         "last_frame": 0,
                         "yolo_id":    yolo_id,
-                        "hist":       None,
+                        "hist":       initial_hist,
                         "zone":       self.slot_zones[slot],
                     }
+            print(f"[Tracker INIT] Histogramas iniciales: { {s: 'OK' if v and v.get('hist') is not None else 'None' for s,v in self.slots.items()} }")
 
             self.initialized = True
             print(f"[Tracker INIT] ===== INICIALIZACIÓN COMPLETADA =====")
