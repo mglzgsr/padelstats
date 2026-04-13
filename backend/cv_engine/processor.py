@@ -162,9 +162,13 @@ class VideoProcessor:
                 tn = self.tracknet_positions.get(frame_count)
                 if tn and tn[2]:  # visible=True
                     tx, ty, _ = tn
-                    # Filtrar por polígono de la pista: descartar detecciones fuera
-                    in_court = cv2.pointPolygonTest(court_polygon, (float(tx), float(ty)), False) >= 0
-                    if not in_court:
+                    # Filtrar solo por coordenadas X del polígono (banda horizontal).
+                    # NO filtrar por Y: la pelota puede estar en el aire (lobs, smashes)
+                    # por encima del polígono de suelo. Sí descartamos X fuera del ancho
+                    # de la pista para evitar detecciones en la pista adyacente.
+                    poly_xs = court_polygon[:, 0]
+                    x_min, x_max = float(poly_xs.min()), float(poly_xs.max())
+                    if not (x_min <= tx <= x_max):
                         tn = None
                 if tn and tn[2]:
                     tx, ty, _ = tn

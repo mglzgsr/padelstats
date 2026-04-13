@@ -82,7 +82,7 @@ class Tracker:
         self.slots = {1: None, 2: None, 3: None, 4: None}
         self.slot_zones = {1: 'near', 2: 'near', 3: 'far', 4: 'far'}
         self.max_distance = 400       # px – umbral espacial para matching
-        self.max_lost_frames = 90     # frames antes de expirar un slot (~3s a 30fps)
+        self.max_lost_frames = 300    # frames antes de expirar un slot (~10s a 30fps)
         self.CONFIRM_FRAMES = 3       # frames consecutivos para confirmar reasignación
         self._pending = {}            # {yolo_id: (slot, count)}
         self.hist_alpha = 0.2         # peso del histograma nuevo en el blend EWA
