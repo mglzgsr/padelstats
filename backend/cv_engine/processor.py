@@ -176,6 +176,16 @@ class VideoProcessor:
                         tn = None
                 if tn and tn[2]:
                     tx, ty, _ = tn
+                    # Filtro de velocidad: rechazar saltos imposibles entre frames.
+                    # Pelota a 200km/h en 4K (~10m=3840px) a 30fps → ~700px/frame máx.
+                    if self.last_ball_pos is not None:
+                        lx, ly, lf = self.last_ball_pos
+                        df = max(1, frame_count - lf)
+                        jump = ((tx - lx)**2 + (ty - ly)**2) ** 0.5 / df
+                        if jump > 750:   # px/frame — imposible físicamente
+                            tn = None   # descartar como falso positivo
+                if tn and tn[2]:
+                    tx, ty, _ = tn
                     r = 8
                     trusted_ball_boxes = [SimpleBox([tx - r, ty - r, tx + r, ty + r])]
                     self.stats["ball_detected"] += 1

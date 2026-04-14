@@ -81,7 +81,7 @@ class Tracker:
         # Estado para _update_slots (Hungarian + color histograms)
         self.slots = {1: None, 2: None, 3: None, 4: None}
         self.slot_zones = {1: 'near', 2: 'near', 3: 'far', 4: 'far'}
-        self.max_distance = 400       # px – umbral espacial para matching
+        self.max_distance = 700       # px – umbral espacial para matching
         self.max_lost_frames = 300    # frames antes de expirar un slot (~10s a 30fps)
         self.CONFIRM_FRAMES = 3       # frames consecutivos para confirmar reasignación
         self._pending = {}            # {yolo_id: (slot, count)}
@@ -501,7 +501,7 @@ class Tracker:
             row_ind, col_ind = linear_sum_assignment(cost)
 
             for r, c in zip(row_ind, col_ind):
-                if cost[r, c] >= 0.75:
+                if cost[r, c] >= 0.90:
                     continue
                 sid = active_slots[c]
                 d   = detections[r]
