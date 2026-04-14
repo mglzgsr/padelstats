@@ -649,13 +649,17 @@ class Tracker:
         detections = sv.Detections.from_ultralytics(person_results)
 
         # 3. Filtrar por polígono de cancha
+        # Permitir 80px de margen fuera del polígono: jugadores contra el cristal
+        # tienen los pies justo en el borde o ligeramente fuera.
+        PLAYER_POLYGON_MARGIN = -80  # px (negativo = fuera del polígono)
         if court_polygon is not None:
             before_filter = len(detections)
             mask = []
             for i in range(len(detections)):
                 xyxy = detections.xyxy[i]
                 feet = ((xyxy[0] + xyxy[2]) / 2, xyxy[3])
-                mask.append(cv2.pointPolygonTest(court_polygon, feet, False) >= 0)
+                dist = cv2.pointPolygonTest(court_polygon, feet, True)  # measureDist=True
+                mask.append(dist >= PLAYER_POLYGON_MARGIN)
             detections = detections[np.array(mask)]
             after_filter = len(detections)
 

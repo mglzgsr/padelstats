@@ -381,12 +381,14 @@ class VideoProcessor:
                 p_id = mapping.get(yolo_id, 0)
                 player_data.append((px1, py1, px2, py2, p_id))
 
-            impact = self.shot_classifier.detect_impact(frame_count, ball_pos, player_data)
+            # Solo detectar golpes si los jugadores están inicializados (J1-J4 asignados)
+            # y hay al menos un jugador con slot válido (pid > 0) cerca de la pelota
+            has_valid_players = any(p[4] > 0 for p in player_data)
+            impact = self.shot_classifier.detect_impact(frame_count, ball_pos, player_data) if has_valid_players else None
             if impact:
                 event_data = self.shot_classifier.classify_shot(impact, player_data)
-                if event_data:
-                    # Temporalmente permitir J0 para debug (normalmente filtrar player_id=0)
-                    if event_data["event"] == "Shot": # and event_data.get("player_id", 0) > 0:
+                if event_data and event_data.get("player_id", 0) > 0:
+                    if event_data["event"] == "Shot":
                         self.detected_shots.append(event_data)
                         self.stats["shots_detected"] += 1
                         if on_event:
