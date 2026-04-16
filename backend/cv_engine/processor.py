@@ -86,6 +86,8 @@ class VideoProcessor:
         fps_ratio = fps / 30.0
         self.shot_classifier.fps = fps
         self.shot_classifier.shot_cooldown = max(20, int(fps * 0.8))  # ~0.8s
+        self.shot_classifier.last_shot_frame = {1: -999, 2: -999, 3: -999, 4: -999, 0: -999}
+        self.shot_classifier.player_buffers  = {1: [], 2: [], 3: [], 4: []}
         self.tracker.max_lost_frames = int(300 * fps_ratio)           # ~10s
         self.tracker.max_missed_ball_frames = int(self.max_missed_frames * fps_ratio)
         self.max_missed_frames = int(30 * fps_ratio)  # ~0.5s
