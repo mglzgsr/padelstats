@@ -10,7 +10,7 @@ class ShotClassifier:
     MIN_DEPARTURE  = 2    # puntos mínimos después del mínimo
     APP_RATIO      = 0.92 # segunda mitad del approach < primera mitad * ratio
     DEP_RATIO      = 1.08 # segunda mitad del departure > primera mitad * ratio
-    MIN_DIR_CHANGE = 30   # grados mínimos de cambio de dirección (fly-by < 30°, golpe real > 30°)
+    MIN_DIR_CHANGE  = 40  # grados mínimos de cambio de dirección (fly-by < 40°, golpe real > 40°)
     GLOBAL_COOLDOWN = 20  # frames de bloqueo global después de cualquier golpe (~0.67s a 30fps)
 
     def __init__(self, fps=30.0):
@@ -58,7 +58,9 @@ class ShotClassifier:
 
             # Threshold: pelota debe estar dentro o muy cerca del bbox del jugador.
             # Para un jugador de 200px de alto → max(50, 80, 100) = 80px del centro.
-            threshold = max(50, min(p_height * 0.40, 100))
+            # Threshold: cubre cuerpo + alcance de raqueta (~50-70cm real → 65% del bbox).
+            # El filtro de dirección (MIN_DIR_CHANGE=40°) evita fly-bys con este radio amplio.
+            threshold = max(70, min(p_height * 0.65, 180))
 
             buf = self.player_buffers[pid]
             buf.append((dist, threshold, (bx, by), frame_idx))
