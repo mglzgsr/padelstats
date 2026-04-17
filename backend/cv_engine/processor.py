@@ -387,11 +387,26 @@ class VideoProcessor:
             if frame_count % 300 == 0 and mapping:
                 print(f"[DEBUG] Frame {frame_count} - slot_mapping: {mapping}")
 
-            for p_box in filtered_p_boxes:
-                px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy()
-                yolo_id = int(p_box.id[0]) if p_box.id is not None else -1
-                p_id = mapping.get(yolo_id, 0)
-                player_data.append((px1, py1, px2, py2, p_id))
+            # IMPORTANTE: usar filtered_detections (sv.Detections con tracker_id de ByteTrack)
+            # NO usar filtered_p_boxes (YOLO crudo sin IDs → p_box.id siempre None → p_id=0)
+            tracked_dets = (
+                person_results.filtered_detections
+                if hasattr(person_results, 'filtered_detections') and person_results.filtered_detections is not None
+                else None
+            )
+            if tracked_dets is not None and len(tracked_dets) > 0:
+                for i in range(len(tracked_dets)):
+                    px1, py1, px2, py2 = tracked_dets.xyxy[i]
+                    yolo_id = int(tracked_dets.tracker_id[i]) if tracked_dets.tracker_id is not None else -1
+                    p_id = mapping.get(yolo_id, 0)
+                    player_data.append((float(px1), float(py1), float(px2), float(py2), p_id))
+            else:
+                # Fallback a raw boxes (p_ids serán 0, se filtra en has_valid_players)
+                for p_box in filtered_p_boxes:
+                    px1, py1, px2, py2 = p_box.xyxy[0].cpu().numpy()
+                    yolo_id = int(p_box.id[0]) if p_box.id is not None else -1
+                    p_id = mapping.get(yolo_id, 0)
+                    player_data.append((px1, py1, px2, py2, p_id))
 
             # Solo detectar golpes si los jugadores están inicializados (J1-J4 asignados)
             # y hay al menos un jugador con slot válido (pid > 0) cerca de la pelota
