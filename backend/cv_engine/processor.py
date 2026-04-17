@@ -409,6 +409,27 @@ class VideoProcessor:
                     p_id = mapping.get(yolo_id, 0)
                     player_data.append((px1, py1, px2, py2, p_id))
 
+            # --- Entradas fantasma para slots activos no detectados en este frame ---
+            # Cuando J1 o J2 salen del encuadre (pegados al cristal lateral), YOLO no
+            # los detecta pero el slot mantiene su última posición conocida.
+            # Usamos esa posición para que el shot classifier pueda atribuirles golpes.
+            GHOST_MAX_FRAMES = 90   # ~3s a 30fps — después ignorar
+            detected_slot_ids = {p[4] for p in player_data if p[4] > 0}
+            if self.tracker.initialized:
+                for slot_id, slot_data in self.tracker.slots.items():
+                    if slot_id in detected_slot_ids:
+                        continue    # ya detectado, no duplicar
+                    if not slot_data:
+                        continue
+                    frames_since = frame_count - slot_data.get("last_frame", 0)
+                    if frames_since > GHOST_MAX_FRAMES:
+                        continue
+                    xyxy = slot_data.get("last_xyxy")
+                    if xyxy is None:
+                        continue
+                    px1, py1, px2, py2 = float(xyxy[0]), float(xyxy[1]), float(xyxy[2]), float(xyxy[3])
+                    player_data.append((px1, py1, px2, py2, slot_id))
+
             # Solo detectar golpes si los jugadores están inicializados (J1-J4 asignados)
             # y hay al menos un jugador con slot válido (pid > 0) cerca de la pelota
             has_valid_players = any(p[4] > 0 for p in player_data)

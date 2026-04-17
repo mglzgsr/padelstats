@@ -191,6 +191,7 @@ class Tracker:
                         "yolo_id":    yolo_id,
                         "hist":       initial_hist,
                         "zone":       self.slot_zones[slot],
+                        "last_xyxy":  det["xyxy"],
                     }
             print(f"[Tracker INIT] Histogramas iniciales: { {s: 'OK' if v and v.get('hist') is not None else 'None' for s,v in self.slots.items()} }")
 
@@ -527,6 +528,7 @@ class Tracker:
                         self._maybe_flip_zone(current_sid, d["xyxy"][3])
                         self.slots[current_sid]["last_pos"]   = d["pos"]
                         self.slots[current_sid]["last_frame"] = frame_count
+                        self.slots[current_sid]["last_xyxy"]  = d["xyxy"]
                         self.slots[current_sid]["hist"] = self._blend_hist(
                             self.slots[current_sid].get("hist"), d["hist"]
                         )
@@ -546,6 +548,7 @@ class Tracker:
                     "yolo_id":    yid,
                     "hist":       self._blend_hist(self.slots[sid].get("hist") if self.slots[sid] else None, d["hist"]),
                     "zone":       self.slot_zones[sid],
+                    "last_xyxy":  d["xyxy"],
                 }
                 mapping[yid] = sid
                 assigned_det_indices.add(r)
@@ -584,6 +587,7 @@ class Tracker:
                 "yolo_id":    d["id"],
                 "hist":       d["hist"],
                 "zone":       self.slot_zones[sid],
+                "last_xyxy":  d["xyxy"],
             }
             mapping[d["id"]] = sid
 
