@@ -140,12 +140,13 @@ class ShotClassifier:
                     cos_a = np.clip((vb[0]*va[0] + vb[1]*va[1]) / (mag_b * mag_a), -1, 1)
                     angle_deg = float(np.degrees(np.arccos(cos_a)))
                     dir_ok = angle_deg >= self.MIN_DIR_CHANGE
-                    if not dir_ok and min_dist < min_thr * 1.5:
+                    # Log fly-by solo 1 vez por mínimo (evitar spam)
+                    if not dir_ok and min_dist < min_thr * 1.5 and frame_idx == min_frame + self.RECENT_WINDOW:
                         print(f"[ShotDebug] J{pid} f={min_frame} RECHAZADO fly-by "
                               f"(ángulo={angle_deg:.1f}° < {self.MIN_DIR_CHANGE}°)")
 
             if not dir_ok:
-                continue
+                continue  # ya logueado arriba cuando min_dist < min_thr*1.5
 
             # Cooldown por jugador
             if min_frame - self.last_shot_frame.get(pid, -999) < self.shot_cooldown:
