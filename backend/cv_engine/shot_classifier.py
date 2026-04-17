@@ -51,16 +51,18 @@ class ShotClassifier:
                 continue
             if pid not in self.player_buffers:
                 continue
-            p_height = max(py2 - py1, 1)
-            cx = (px1 + px2) / 2
-            cy = (py1 + py2) / 2
-            dist = np.sqrt((bx - cx)**2 + (by - cy)**2)
+            # Distancia al BORDE más cercano del bbox (no al centro).
+            # Si la pelota está dentro del bbox → dist=0.
+            # Si la raqueta extendida lleva la pelota 80px fuera del bbox → dist=80.
+            # Mucho más realista que distancia al centro cuando el jugador se estira
+            # (golpe bajo, forehand amplio, smash con raqueta extendida, etc.)
+            edge_x = max(0.0, max(float(px1) - bx, bx - float(px2)))
+            edge_y = max(0.0, max(float(py1) - by, by - float(py2)))
+            dist = float(np.sqrt(edge_x**2 + edge_y**2))
 
-            # Threshold: pelota debe estar dentro o muy cerca del bbox del jugador.
-            # Para un jugador de 200px de alto → max(50, 80, 100) = 80px del centro.
-            # Threshold: cubre cuerpo + alcance de raqueta (~50-70cm real → 65% del bbox).
-            # El filtro de dirección (MIN_DIR_CHANGE=40°) evita fly-bys con este radio amplio.
-            threshold = max(70, min(p_height * 0.65, 180))
+            # Threshold fijo = alcance de raqueta fuera del bbox (~60-80cm real ≈ 120px).
+            # El filtro de dirección (≥40°) evita que fly-bys lejanos cuenten.
+            threshold = 120.0
 
             buf = self.player_buffers[pid]
             buf.append((dist, threshold, (bx, by), frame_idx))
