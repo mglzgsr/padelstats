@@ -1,180 +1,134 @@
 import numpy as np
-from .ball_tracker import BallTracker
 
 class ShotClassifier:
-    """Detector de golpes basado en proximidad pelota-jugador."""
+    """
+    Detector de golpes basado en cambio de dirección de la pelota.
 
-    BUFFER_SIZE    = 40   # historial de distancias por jugador
-    RECENT_WINDOW  = 14   # ventana de análisis (frames)
-    MIN_APPROACH   = 2    # puntos mínimos antes del mínimo
-    MIN_DEPARTURE  = 2    # puntos mínimos después del mínimo
-    APP_RATIO      = 0.92 # segunda mitad del approach < primera mitad * ratio
-    DEP_RATIO      = 1.08 # segunda mitad del departure > primera mitad * ratio
-    MIN_DIR_CHANGE  = 40  # grados mínimos de cambio de dirección (fly-by < 40°, golpe real > 40°)
-    GLOBAL_COOLDOWN = 20  # frames de bloqueo global después de cualquier golpe (~0.67s a 30fps)
+    Con TrackNet al 99.9% tenemos la trayectoria casi completa de la pelota.
+    Un golpe real SIEMPRE cambia la dirección del vuelo (>80°).
+    Un fly-by o un pase cerca de un jugador NO cambia la dirección.
+
+    Flujo:
+    1. Acumular posiciones raw de la pelota (sin Kalman — más fiel al impacto real).
+    2. Calcular vectores de velocidad antes y después de cada punto.
+    3. Si el ángulo entre ambos vectores > MIN_ANGLE → posible golpe.
+    4. El golpe se atribuye al jugador más cercano a la posición de impacto,
+       siempre que esté a menos de MAX_PLAYER_DIST (filtra rebotes en cristal/red).
+    5. Cooldown global de COOLDOWN_FRAMES para evitar dobles detecciones.
+    """
+
+    MIN_ANGLE        = 80    # grados — golpe real >80°, fly-by <30°
+    MAX_PLAYER_DIST  = 500   # px — si no hay jugador cerca, es rebote en pared
+    COOLDOWN_FRAMES  = 20    # frames de bloqueo global tras cada golpe (~0.67s a 30fps)
+    HISTORY_SIZE     = 20    # frames de historial de trayectoria
+    CHECK_OFFSET     = 5     # frames hacia atrás para buscar el punto de impacto
+    VELOCITY_WINDOW  = 3     # frames para promediar velocidad antes/después
 
     def __init__(self, fps=30.0):
         self.fps = fps
-        self.shot_cooldown = max(15, int(fps * 0.5))
-        self.last_shot_frame = {1: -999, 2: -999, 3: -999, 4: -999, 0: -999}
-        self.last_any_shot_frame = -999  # cooldown global (sólo 1 golpe a la vez)
-
-        # Buffer por jugador: [(dist, threshold, (bx, by), frame_idx), ...]
-        self.player_buffers = {1: [], 2: [], 3: [], 4: []}
-
-        # Ball Tracker con Kalman Filter para interpolación
-        self.ball_tracker = BallTracker(fps=int(fps))
-        print(f"[ShotClassifier] Inicializado con buffers por jugador (fps={fps})")
+        self.ball_history = []          # [(x, y, frame_idx), ...]
+        self.last_shot_frame = -999     # para cooldown global
+        print(f"[ShotClassifier] Detector por cambio de dirección iniciado (fps={fps})")
 
     # ------------------------------------------------------------------
     def detect_impact(self, frame_idx, ball_pos, players):
-        """Detecta golpe con approach→min→departure + check de cambio de dirección."""
-        if not players:
+        """
+        Detecta un golpe cuando la pelota cambia de dirección bruscamente.
+        Devuelve dict con frame/pos/player_id o None.
+        """
+        if ball_pos is None:
             return None
 
-        # Actualizar ball tracker (interpola si ball_pos es None)
-        if ball_pos is not None:
-            bx, by = ball_pos
-            ball_tracked = self.ball_tracker.update(frame_idx, (bx, by, 0.5))
-        else:
-            ball_tracked = self.ball_tracker.update(frame_idx, None)
+        bx, by = float(ball_pos[0]), float(ball_pos[1])
+        self.ball_history.append((bx, by, frame_idx))
+        if len(self.ball_history) > self.HISTORY_SIZE:
+            self.ball_history.pop(0)
 
-        if ball_tracked is None:
+        # Necesitamos suficientes puntos para tener antes + después del impacto
+        needed = self.CHECK_OFFSET + self.VELOCITY_WINDOW + 1
+        if len(self.ball_history) < needed:
             return None
 
-        bx, by, conf = ball_tracked
+        # Cooldown global
+        if frame_idx - self.last_shot_frame < self.COOLDOWN_FRAMES:
+            return None
 
-        # --- Actualizar buffers por jugador ---
-        for p in players:
-            px1, py1, px2, py2, pid = p
-            if pid <= 0:
-                continue
-            if pid not in self.player_buffers:
-                continue
-            # Distancia al BORDE más cercano del bbox (no al centro).
-            # Si la pelota está dentro del bbox → dist=0.
-            # Si la raqueta extendida lleva la pelota 80px fuera del bbox → dist=80.
-            # Mucho más realista que distancia al centro cuando el jugador se estira
-            # (golpe bajo, forehand amplio, smash con raqueta extendida, etc.)
-            edge_x = max(0.0, max(float(px1) - bx, bx - float(px2)))
-            edge_y = max(0.0, max(float(py1) - by, by - float(py2)))
-            dist = float(np.sqrt(edge_x**2 + edge_y**2))
+        # Punto de impacto candidato: CHECK_OFFSET frames antes del actual
+        impact_idx = len(self.ball_history) - 1 - self.CHECK_OFFSET
+        if impact_idx < self.VELOCITY_WINDOW:
+            return None
 
-            # Threshold fijo = alcance de raqueta fuera del bbox (~60-80cm real ≈ 120px).
-            # El filtro de dirección (≥40°) evita que fly-bys lejanos cuenten.
-            threshold = 120.0
+        impact_x, impact_y, impact_frame = self.ball_history[impact_idx]
 
-            buf = self.player_buffers[pid]
-            buf.append((dist, threshold, (bx, by), frame_idx))
-            if len(buf) > self.BUFFER_SIZE:
-                buf.pop(0)
+        # Vectores de velocidad: promedio de VELOCITY_WINDOW frames antes y después
+        before = self.ball_history[impact_idx - self.VELOCITY_WINDOW: impact_idx]
+        after  = self.ball_history[impact_idx + 1: impact_idx + 1 + self.VELOCITY_WINDOW]
+
+        if len(before) < 2 or len(after) < 2:
+            return None
+
+        # Velocidad media antes del impacto
+        dt_b = max(1, before[-1][2] - before[0][2])
+        vb = ((before[-1][0] - before[0][0]) / dt_b,
+              (before[-1][1] - before[0][1]) / dt_b)
+
+        # Velocidad media después del impacto
+        dt_a = max(1, after[-1][2] - after[0][2])
+        va = ((after[-1][0] - after[0][0]) / dt_a,
+              (after[-1][1] - after[0][1]) / dt_a)
+
+        speed_b = np.sqrt(vb[0]**2 + vb[1]**2)
+        speed_a = np.sqrt(va[0]**2 + va[1]**2)
+
+        # Ignorar si la pelota está casi parada (TrackNet confundido o pausa)
+        if speed_b < 3.0 or speed_a < 3.0:
+            return None
+
+        # Ángulo entre los dos vectores de velocidad
+        cos_a = np.clip((vb[0]*va[0] + vb[1]*va[1]) / (speed_b * speed_a), -1.0, 1.0)
+        angle = float(np.degrees(np.arccos(cos_a)))
 
         # Debug cada 300 frames
         if frame_idx % 300 == 0:
-            for pid, buf in self.player_buffers.items():
-                if buf:
-                    d, thr, _, _ = buf[-1]
-                    print(f"[ShotDebug] Frame {frame_idx} J{pid}: dist={d:.0f}px thr={thr:.0f}px")
+            print(f"[ShotDebug] Frame {frame_idx}: ángulo={angle:.1f}° speed_b={speed_b:.1f} speed_a={speed_a:.1f}")
 
-        # Bloqueo global: si acaba de detectarse un golpe, esperar antes de detectar otro
-        if frame_idx - self.last_any_shot_frame < self.GLOBAL_COOLDOWN:
+        if angle < self.MIN_ANGLE:
             return None
 
-        # --- Comprobar patrón approach→min→departure por jugador ---
-        best_impact = None
-        best_dist   = float('inf')
+        # --- Golpe detectado — atribuir al jugador más cercano ---
+        if not players:
+            return None
 
-        for pid, buf in self.player_buffers.items():
-            if len(buf) < 5:
-                continue
+        closest_pid  = 0
+        closest_dist = float('inf')
+        for px1, py1, px2, py2, pid in players:
+            cx = (px1 + px2) / 2
+            cy = (py1 + py2) / 2
+            d  = np.sqrt((impact_x - cx)**2 + (impact_y - cy)**2)
+            if d < closest_dist:
+                closest_dist = d
+                closest_pid  = pid
 
-            recent = buf[-self.RECENT_WINDOW:]
-            if len(recent) < 5:
-                continue
+        # Si no hay ningún jugador cerca → rebote en pared/red, no un golpe
+        if closest_dist > self.MAX_PLAYER_DIST:
+            if frame_idx % 100 == 0:
+                print(f"[ShotDebug] Frame {frame_idx}: ángulo={angle:.1f}° RECHAZADO "
+                      f"(jugador más cercano a {closest_dist:.0f}px > {self.MAX_PLAYER_DIST}px)")
+            return None
 
-            min_idx = min(range(len(recent)), key=lambda i: recent[i][0])
-            min_dist, min_thr, min_pos, min_frame = recent[min_idx]
+        if closest_pid <= 0:
+            return None
 
-            # El mínimo debe estar en el interior de la ventana (margen de 2)
-            margin = 2
-            if min_idx < margin or min_idx > len(recent) - margin - 1:
-                continue
-
-            # Pelota debe estar dentro o muy cerca del bbox
-            if min_dist > min_thr:
-                continue
-
-            approach  = [d for d, _, _, _ in recent[:min_idx][-4:]]
-            departure = [d for d, _, _, _ in recent[min_idx + 1:][:4]]
-
-            if len(approach) < self.MIN_APPROACH or len(departure) < self.MIN_DEPARTURE:
-                continue
-
-            app_first  = np.mean(approach[:len(approach)//2 + 1])
-            app_second = np.mean(approach[len(approach)//2:])
-            dep_first  = np.mean(departure[:len(departure)//2 + 1])
-            dep_second = np.mean(departure[len(departure)//2:])
-
-            is_app = app_second < app_first * self.APP_RATIO
-            is_dep = dep_second > dep_first * self.DEP_RATIO
-
-            if not (is_app and is_dep):
-                if min_dist < min_thr * 1.5 and frame_idx % 150 == 0:
-                    print(f"[ShotDebug] J{pid} f={min_frame} dist={min_dist:.0f}/{min_thr:.0f} "
-                          f"app={'OK' if is_app else 'FAIL'}({app_first:.0f}→{app_second:.0f}) "
-                          f"dep={'OK' if is_dep else 'FAIL'}({dep_first:.0f}→{dep_second:.0f})")
-                continue
-
-            # --- Check cambio de dirección ---
-            # Un fly-by mantiene la dirección (<30°); un golpe real la cambia (>30°)
-            before_pos = [entry[2] for entry in recent[:min_idx][-3:]]
-            after_pos  = [entry[2] for entry in recent[min_idx + 1:][:3]]
-
-            dir_ok = True  # asumir OK si no hay suficientes puntos para calcular
-            if len(before_pos) >= 2 and len(after_pos) >= 2:
-                vb = (before_pos[-1][0] - before_pos[-2][0],
-                      before_pos[-1][1] - before_pos[-2][1])
-                va = (after_pos[1][0]  - after_pos[0][0],
-                      after_pos[1][1]  - after_pos[0][1])
-                mag_b = (vb[0]**2 + vb[1]**2) ** 0.5
-                mag_a = (va[0]**2 + va[1]**2) ** 0.5
-                if mag_b > 2 and mag_a > 2:
-                    cos_a = np.clip((vb[0]*va[0] + vb[1]*va[1]) / (mag_b * mag_a), -1, 1)
-                    angle_deg = float(np.degrees(np.arccos(cos_a)))
-                    dir_ok = angle_deg >= self.MIN_DIR_CHANGE
-                    # Log fly-by solo 1 vez por mínimo (evitar spam)
-                    if not dir_ok and min_dist < min_thr * 1.5 and frame_idx == min_frame + self.RECENT_WINDOW:
-                        print(f"[ShotDebug] J{pid} f={min_frame} RECHAZADO fly-by "
-                              f"(ángulo={angle_deg:.1f}° < {self.MIN_DIR_CHANGE}°)")
-
-            if not dir_ok:
-                continue  # ya logueado arriba cuando min_dist < min_thr*1.5
-
-            # Cooldown por jugador
-            if min_frame - self.last_shot_frame.get(pid, -999) < self.shot_cooldown:
-                continue
-
-            # Elegir el mejor candidato (menor distancia al mínimo)
-            if min_dist < best_dist:
-                best_dist   = min_dist
-                best_impact = {
-                    "frame":     min_frame,
-                    "pos":       min_pos,
-                    "player_id": pid,
-                    "min_dist":  min_dist,
-                    "min_thr":   min_thr,
-                }
-
-        if best_impact:
-            pid = best_impact["player_id"]
-            print(f"[Shot] Frame {frame_idx}: GOLPE J{pid} "
-                  f"(dist={best_impact['min_dist']:.1f}px thr={best_impact['min_thr']:.1f}px)")
-            # Cooldown individual + global
-            self.last_shot_frame[pid] = best_impact["frame"]
-            self.last_any_shot_frame  = best_impact["frame"]
-            return best_impact
-
-        return None
+        print(f"[Shot] Frame {frame_idx}: GOLPE J{closest_pid} "
+              f"(ángulo={angle:.1f}° dist={closest_dist:.0f}px impact_frame={impact_frame})")
+        self.last_shot_frame = impact_frame
+        return {
+            "frame":     impact_frame,
+            "pos":       (impact_x, impact_y),
+            "player_id": closest_pid,
+            "angle":     angle,
+            "dist":      closest_dist,
+        }
 
     # ------------------------------------------------------------------
     def classify_shot(self, impact, players):
